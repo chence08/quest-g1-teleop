@@ -1,0 +1,8 @@
+Quest G1 Teleoperation
+Copyright 2026 Quest G1 Teleoperation contributors.
+
+This repository contains integration helpers for xr_teleoperate, Unitree SDK2,
+TeleVuer, dex-retargeting, and the DFX Inspire service. It is not an official
+Unitree or Meta product. Upstream projects retain their own copyrights and
+licenses. Source patches retain the corresponding upstream licenses.
+See THIRD_PARTY_NOTICES.md and third_party/ for attribution and license notices.

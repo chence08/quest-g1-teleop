@@ -1,0 +1,22 @@
+# Generated dependencies and local machine state
+/env/
+/env-*/
+/repos/
+/.cache/
+/certs/
+/reports/
+/config/local.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.srl
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/build/
+/dist/
+*.egg-info/
+.DS_Store

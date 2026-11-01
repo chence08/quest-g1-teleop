@@ -1,0 +1,9 @@
+numpy==1.26.4
+casadi==3.6.7
+opencv-python==4.11.0.86
+torch==2.3.0
+nlopt==2.7.1
+cyclonedds==0.10.2
+vuer==0.0.60
+params-proto==2.13.0
+pymodbus==3.6.9

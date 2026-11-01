@@ -1,0 +1,39 @@
+{
+  "repositories": [
+    {
+      "path": "repos/xr_teleoperate",
+      "url": "https://github.com/unitreerobotics/xr_teleoperate.git",
+      "commit": "817fb00c63cde15e5f24a0f8fa08e1e33ed89d3b"
+    },
+    {
+      "path": "repos/xr_teleoperate/teleop/televuer",
+      "url": "https://github.com/unitreerobotics/televuer",
+      "commit": "766de45e74373ae0ea66321d942ce538385655a5"
+    },
+    {
+      "path": "repos/xr_teleoperate/teleop/teleimager",
+      "url": "https://github.com/unitreerobotics/teleimager.git",
+      "commit": "57cf2a40572227273fa001cd17833b755331ec97"
+    },
+    {
+      "path": "repos/xr_teleoperate/teleop/robot_control/dex-retargeting",
+      "url": "https://github.com/silencht/dex-retargeting",
+      "commit": "d7753d38c9ff11f80bafea6cd168351fd3db9b0e"
+    },
+    {
+      "path": "repos/unitree_sdk2_python",
+      "url": "https://github.com/unitreerobotics/unitree_sdk2_python.git",
+      "commit": "814556d15970dd2ecf1c9984e845ca02ab07e206"
+    },
+    {
+      "path": "repos/DFX_inspire_service",
+      "url": "https://github.com/unitreerobotics/DFX_inspire_service.git",
+      "commit": "d6c4eae9bc959990bf87c262f29f62142519e923"
+    },
+    {
+      "path": "repos/inspire_hand_ws",
+      "url": "https://github.com/NaCl-1374/inspire_hand_ws.git",
+      "commit": "fc754900caaaa82c9b59fb12c1b79ebfd1c1a0e7"
+    }
+  ]
+}

@@ -1,0 +1,303 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -32,4 +32,6 @@
+ add_executable(inspire_h1 inspire_h1.cpp)
+ 
+ # example
+-add_executable(hand_example example/hand_example.cpp)
+\ No newline at end of file
++add_executable(hand_example example/hand_example.cpp)
++find_package(spdlog REQUIRED)
++target_link_libraries(inspire_g1 spdlog::spdlog)
+--- a/inspire_g1.cpp
++++ b/inspire_g1.cpp
+@@ -1,4 +1,5 @@
+ #include "inspire.h"
++#include <limits>
+ #include "param.h"
+ 
+ #include "dds/Publisher.h"
+@@ -42,8 +43,16 @@
+       {
+         qcmd(i) = handcmd->msg_.cmds()[i].q();
+       }
+-      righthand->SetPosition(qcmd.block<6, 1>(0, 0));
+-      lefthand->SetPosition(qcmd.block<6, 1>(6, 0));
++      // A rejected/timed-out ACK also invalidates the Python state gate, even
++      // if the following position read succeeds. Never hide command failures.
++      if(righthand->SetPosition(qcmd.block<6, 1>(0, 0)) != 0)
++      {
++        for(int i = 0; i < 6; ++i) handstate->msg_.states()[i].lost()++;
++      }
++      if(lefthand->SetPosition(qcmd.block<6, 1>(6, 0)) != 0)
++      {
++        for(int i = 6; i < 12; ++i) handstate->msg_.states()[i].lost()++;
++      }
+     }
+ 
+     // Recv state
+@@ -89,7 +98,8 @@
+   SerialPort::SharedPtr serial2;
+   std::shared_ptr<inspire::InspireHand> lefthand;
+   std::shared_ptr<inspire::InspireHand> righthand;
+-  Eigen::Matrix<double, 12, 1> qcmd, qstate;
++  Eigen::Matrix<double, 12, 1> qcmd = Eigen::Matrix<double, 12, 1>::Zero();
++  Eigen::Matrix<double, 12, 1> qstate = Eigen::Matrix<double, 12, 1>::Constant(std::numeric_limits<double>::quiet_NaN());
+ 
+   // dds
+   std::unique_ptr<unitree::robot::RealTimePublisher<unitree_go::msg::dds_::MotorStates_>> handstate;
+@@ -111,4 +121,4 @@
+     sleep(1);
+   }
+   return 0;
+-}
+\ No newline at end of file
++}
+--- a/include/SerialPort.h
++++ b/include/SerialPort.h
+@@ -13,11 +13,16 @@
+ #include <memory>
+ #include <chrono>
+ #include <queue>
++#include <array>
++#include <algorithm>
++#include <cerrno>
+ 
+ class SerialPort
+ {
+ public:
+   using SharedPtr = std::shared_ptr<SerialPort>;
++  using Clock = std::chrono::steady_clock;
++  using Deadline = Clock::time_point;
+ 
+   SerialPort(std::string port, speed_t baudrate, int timeout_ms = 2)
+   {
+@@ -32,44 +37,79 @@
+ 
+   ssize_t send(const uint8_t* data, size_t len)
+   {
+-    ssize_t ret = ::write(fd_, data, len);
+-    return ret;
++    return send_until(data, len, Clock::now() + std::chrono::milliseconds(timeout_ms_));
++  }
++
++  // All partial writes share one absolute deadline.
++  ssize_t send_until(const uint8_t* data, size_t len, Deadline deadline)
++  {
++    size_t sent = 0;
++    while(sent < len && Clock::now() < deadline)
++    {
++      const ssize_t count = ::write(fd_, data + sent, len - sent);
++      if(count > 0) { sent += static_cast<size_t>(count); continue; }
++      if(count < 0 && errno == EINTR) continue;
++      if(count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
++      if(wait_ready(deadline, true) <= 0) break;
++    }
++    return static_cast<ssize_t>(sent);
++  }
++
++  // Return available bytes, waiting only until this transaction's deadline.
++  ssize_t recv_some_until(uint8_t* data, size_t len, Deadline deadline)
++  {
++    while(Clock::now() < deadline)
++    {
++      const int ready = wait_ready(deadline, false);
++      if(ready <= 0) return ready;
++      const ssize_t count = ::read(fd_, data, len);
++      if(count > 0) return count;
++      if(count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
++    }
++    return 0;
+   }
+ 
+   ssize_t recv(uint8_t* data, size_t len)
+   {
+-    FD_ZERO(&rSet_);
+-    FD_SET(fd_, &rSet_);
+-    ssize_t recv_len = 0;
+-
+-    switch (select(fd_ + 1, &rSet_, NULL, NULL, &timeout_))
++    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms_);
++    size_t received = 0;
++    while(received < len)
+     {
+-    case -1: // error
+-      // std::cout << "communication error" << std::endl;
+-      break;
+-    case 0: // timeout
+-      // std::cout << "timeout" << std::endl;
+-      break;
+-    default:
+-      recv_len = ::read(fd_, data, len);
+-      break;
++      const ssize_t count = recv_some_until(data + received, len - received, deadline);
++      if(count < 0) return -1;
++      if(count == 0) break;
++      received += static_cast<size_t>(count);
+     }
+-
+-    return recv_len;
++    return static_cast<ssize_t>(received);
+   }
+ 
+-  void set_timeout(int timeout_ms)
++  void set_timeout(int timeout_ms) { timeout_ms_ = std::max(0, timeout_ms); }
++
++private:
++  int wait_ready(Deadline deadline, bool writing)
+   {
+-    timeout_.tv_sec = timeout_ms / 1000;
+-    timeout_.tv_usec = (timeout_ms % 1000) * 1000;
++    while(Clock::now() < deadline)
++    {
++      const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - Clock::now()).count();
++      if(remaining <= 0) return 0;
++      // select modifies timeval and fd_set, so rebuild both for every call.
++      timeval timeout{static_cast<time_t>(remaining / 1000000), static_cast<suseconds_t>(remaining % 1000000)};
++      fd_set descriptors;
++      FD_ZERO(&descriptors);
++      FD_SET(fd_, &descriptors);
++      const int result = select(fd_ + 1, writing ? nullptr : &descriptors,
++                                writing ? &descriptors : nullptr, nullptr, &timeout);
++      if(result < 0 && errno == EINTR) continue;
++      return result;
++    }
++    return 0;
+   }
+ 
+-private:
+   void Init(std::string port, speed_t baudrate)
+   {
+     int ret;
+     // Open serial port
+-    fd_ = open(port.c_str(), O_RDWR | O_NOCTTY);
++    fd_ = open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+     if (fd_ < 0)
+     {
+       printf("Open serial port %s failed\n", port.c_str());
+@@ -103,11 +143,10 @@
+   }
+ 
+   int fd_;
+-	fd_set rSet_;
+-  timeval timeout_;
++  int timeout_ms_ = 2;
+ 
+   std::queue<uint8_t> recv_queue;
+   std::array<uint8_t, 1024> recv_buf;
+ };
+ 
+-#endif // SERIAL_PORT_H
+\ No newline at end of file
++#endif // SERIAL_PORT_H
+--- a/include/inspire.h
++++ b/include/inspire.h
+@@ -39,6 +39,7 @@
+    */
+   int16_t SetPosition(const Eigen::Matrix<double, 6, 1> & q)
+   {
++    if(!q.allFinite() || (q.array() < 0).any() || (q.array() > 1).any()) return 5;
+     Eigen::Matrix<int16_t, 6, 1> q_int16 = (q * 1000).cast<int16_t>().cwiseMax(0).cwiseMin(1000);
+ 
+     uint8_t cmd[20];
+@@ -65,10 +66,9 @@
+ 
+     cmd[19] = CheckSum(cmd, 20);
+ 
+-    serial_->send(cmd, 20);
+-    usleep(5000);
+-    serial_->recv(recvBuff, 9);
+-    return 0;
++    const auto deadline = SerialPort::Clock::now() + std::chrono::milliseconds(40);
++    if(serial_->send_until(cmd, 20, deadline) != 20) return 3;
++    return ReadResponse(0x12, 0x05CE, 9, deadline);
+   }
+ 
+   /**
+@@ -80,13 +80,10 @@
+   {
+     std::vector<uint8_t> cmd = {0xEB, 0x90, id, 0x04, 0x11, 0x0A, 0x06, 0x0C, 0x00};
+     cmd.back() = CheckSum(cmd.data(), cmd.size());
+-    serial_->send(cmd.data(), cmd.size());
+-
+-    usleep(5000);
+-    size_t len = serial_->recv(recvBuff, 20);
+-
+-    if(len != 20) return 1;
+-    if(recvBuff[19] != CheckSum(recvBuff, 20)) return 2;
++    const auto deadline = SerialPort::Clock::now() + std::chrono::milliseconds(40);
++    if(serial_->send_until(cmd.data(), cmd.size(), deadline) != static_cast<ssize_t>(cmd.size())) return 3;
++    const int16_t status = ReadResponse(0x11, 0x060A, 20, deadline);
++    if(status != 0) return status;
+ 
+     q(0) = (recvBuff[7] | (recvBuff[8] << 8)) / 1000.;
+     q(1) = (recvBuff[9] | (recvBuff[10] << 8)) / 1000.;
+@@ -238,6 +235,61 @@
+ 
+   uint8_t id = 1;
+ private:
++  // RH56 replies start 90 EB; frame length is byte[3] + 5. Consume complete
++  // unrelated frames, and never interpret an ACK as angle feedback. No fixed
++  // sleep: USB adapters may buffer data for 16 ms before exposing any bytes.
++  // Return: 0 success, 1 timeout, 2 bad checksum, 3 I/O, 4 wrong frame/ACK,
++  // 5 invalid target. Position feedback is unchanged on any receive failure.
++  int16_t ReadResponse(uint8_t operation, uint16_t address, size_t expected_size,
++                       SerialPort::Deadline deadline)
++  {
++    std::vector<uint8_t> pending;
++    int16_t last_error = 1;
++    while(SerialPort::Clock::now() < deadline)
++    {
++      uint8_t chunk[128];
++      const ssize_t count = serial_->recv_some_until(chunk, sizeof(chunk), deadline);
++      if(count < 0) return 3;
++      if(count == 0) return last_error;
++      pending.insert(pending.end(), chunk, chunk + count);
++      while(pending.size() >= 2)
++      {
++        if(pending[0] != 0x90 || pending[1] != 0xEB)
++        {
++          pending.erase(pending.begin());
++          last_error = 4;
++          continue;
++        }
++        if(pending.size() < 4) break;
++        const size_t frame_size = static_cast<size_t>(pending[3]) + 5;
++        if(frame_size < 8 || frame_size > sizeof(chunk))
++        {
++          pending.erase(pending.begin());
++          last_error = 4;
++          continue;
++        }
++        if(pending.size() < frame_size) break;
++        if(pending[frame_size - 1] != CheckSum(pending.data(), frame_size))
++        {
++          pending.erase(pending.begin());
++          last_error = 2;
++          continue;
++        }
++        const bool matches = frame_size == expected_size && pending[2] == id &&
++                             pending[4] == operation && pending[5] == (address & 0xFF) &&
++                             pending[6] == (address >> 8);
++        if(matches && (operation != 0x12 || pending[7] == 1))
++        {
++          std::copy_n(pending.begin(), frame_size, recvBuff);
++          return 0;
++        }
++        last_error = 4;
++        pending.erase(pending.begin(), pending.begin() + frame_size);
++      }
++    }
++    return last_error;
++  }
++
+   uint8_t CheckSum(const uint8_t* data, uint8_t len)
+   {
+     uint8_t sum = 0;
+@@ -253,4 +305,4 @@
+ };
+ 
+ } // namespace inspire
+-#endif // INSPIRE_H
+\ No newline at end of file
++#endif // INSPIRE_H
