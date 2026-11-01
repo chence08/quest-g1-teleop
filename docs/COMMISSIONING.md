@@ -33,6 +33,10 @@ The sender patch added 0.5-second pre-write qualification, latched stopping afte
 
 Temporarily disabling Wi-Fi power saving reduced median tracking age from about 120 to 32 ms, but ping still lost 1/30 packets and peaked near 238 ms. Wi-Fi was not proven the sole cause; Quest/browser pauses remained possible. Moving closer to the access point or wiring that workstation was unavailable, so attempts ended. Original power saving was restored; task-owned processes and the preview listener were verified stopped.
 
+## 1 November: practical-motion build
+
+The sender and both robot bridges were reworked to follow upstream xr_teleoperate behaviour: stale tracking holds the last target instead of stopping, the ±0.15 rad / 0.15 rad/s arm and ±0.15 finger bounds were replaced by URDF clipping and a 1→10 rad/s velocity ramp, and the mode, FSM, drift, torque and clock gates were removed. Offline tests and a simulated sender session with injected tracking dropouts, IK errors and bridge crashes passed. This build has not yet been run on the robot.
+
 ## Remaining acceptance steps
 
 1. Demonstrate stable Quest tracking delivery on the new workstation's Ethernet/LAN arrangement without relaxing freshness checks.

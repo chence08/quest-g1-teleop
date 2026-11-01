@@ -52,7 +52,8 @@ def retarget_dfq(mapping, data):
     return np.concatenate((targets['right'], targets['left'])).tolist()
 
 
-def tracking_eligible(snapshot, max_age=0.25, max_change_age=0.25):
+def tracking_eligible(snapshot, max_age=0.5, max_change_age=math.inf):
+    """A hand held still keeps a growing change_age, so only packet age matters by default."""
     for side in ('left', 'right'):
         item = snapshot.get(side, {})
         if not item.get('valid', False):
@@ -166,18 +167,19 @@ class RemoteBridge:
                 self.ready.set()
 
     def send(self, command):
+        """Best effort: False when SSH is backed up or closed; the hand holds its last target."""
         payload = (json.dumps(command, allow_nan=False, separators=(',', ':')) + '\n').encode()
         try:
-            count = os.write(self.process.stdin.fileno(), payload)
-        except BlockingIOError:
+            return os.write(self.process.stdin.fileno(), payload) == len(payload)
+        except (BlockingIOError, BrokenPipeError, ValueError, OSError):
             return False
-        if count != len(payload):
-            raise RuntimeError('Partial SSH write; stopping instead of sending malformed commands')
-        return True
 
     def close(self):
         if self.process.stdin and not self.process.stdin.closed:
-            self.process.stdin.close()
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
         try:
             self.process.wait(timeout=3)
         except subprocess.TimeoutExpired:
@@ -245,8 +247,8 @@ def parse_args(argv=None):
     parser.add_argument('--report', type=Path, default=PROJECT_ROOT / 'reports/live-dfx-sender.json')
     args = parser.parse_args(argv)
     validate_host_ip(parser, args.host_ip, args.execute)
-    if not math.isfinite(args.duration) or not 0 < args.duration <= 120:
-        parser.error('--duration must be in (0,120]')
+    if not math.isfinite(args.duration) or args.duration <= 0:
+        parser.error('--duration must be positive')
     if not math.isfinite(args.wait_timeout) or not 0 < args.wait_timeout <= 600:
         parser.error('--wait-timeout must be in (0,600]')
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+', args.ssh_host) or args.ssh_host.startswith('-'):
@@ -279,8 +281,8 @@ def main(argv=None):
     print('Both hands must be visible and changing for 0.5 s before the test starts.', flush=True)
     if args.execute and args.wait_for_arm:
         print("Waiting for explicit arming: type r then Enter while both hands track stably. No SSH until armed.", flush=True)
-    print('Live bridge limits: 0.15 normalized travel around measured start; 0.15 units/s.', flush=True)
-    print('Loss/invalid/stale tracking stops new commands; the hand can finish its last small target. No auto-open/home.', flush=True)
+    print('Live bridge: full normalized finger range, 5 units/s slew.', flush=True)
+    print('Lost tracking holds the last finger target. No auto-open/home.', flush=True)
     try:
         with model_workspace():
             mapping = HandRetargeting(HandType.INSPIRE_HAND)

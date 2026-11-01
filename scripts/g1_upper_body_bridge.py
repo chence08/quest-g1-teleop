@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Bounded G1_29 arm_sdk bridge over newline JSON; read-only unless --execute.
+"""G1_29 arm_sdk bridge over newline JSON; read-only unless --execute.
 
-Only arm motors 15..28 and overlay weight slot29 are populated. Other motor
-fields stay zero. Native firmware decides overlay behavior; waist/IMU drift is
-monitored, not a guarantee that the body cannot move. No mode-setting RPCs,
-lowcmd publisher, home motion, or nonzero feedforward torque are used.
+Follows the upstream xr_teleoperate motion-mode arm controller: arm motors
+15..28 track the latest received target through a joint velocity limit that
+ramps up after engagement, and the overlay weight in slot 29 ramps in at start
+and out on exit. A late, missing or malformed command never stops the bridge;
+it holds the last good target. Only stdin EOF, a signal or --duration end it.
 """
 import argparse
 from dataclasses import dataclass
@@ -28,9 +29,10 @@ LOWER = (-3.0892, -1.5882, -2.618, -1.0472, -1.972222054, -1.614429558, -1.61442
          -3.0892, -2.2515, -2.618, -1.0472, -1.972222054, -1.614429558, -1.614429558)
 UPPER = (2.6704, 2.2515, 2.618, 2.0944, 1.972222054, 1.614429558, 1.614429558,
          2.6704, 1.5882, 2.618, 2.0944, 1.972222054, 1.614429558, 1.614429558)
-EXPECTED_FSM = 500
-PD_LIMIT = tuple(3. if i % 7 >= 5 else 15. for i in range(14))
-MEASURED_TAU_LIMIT = tuple(4. if i % 7 >= 5 else 20. for i in range(14))
+# Upstream G1_29_ArmController gains: kp_low/kd_low for shoulder+elbow, kp_wrist/kd_wrist for wrists.
+KP = tuple(40. if i % 7 >= 4 else 80. for i in range(14))
+KD = tuple(1.5 if i % 7 >= 4 else 3. for i in range(14))
+TAU_LIMIT = 25.  # Clip only garbage feedforward; model gravity torque is far below this.
 
 
 def finite(value):
@@ -44,74 +46,60 @@ def vector(values, size, name):
 
 
 def arm_positions(values):
+    """Clip, never reject, a finite 14-vector to the URDF joint limits."""
     q = vector(values, 14, "q_arm")
-    if any(not low <= value <= high for value, low, high in zip(q, LOWER, UPPER)):
-        raise ValueError("q_arm outside pinned G1 URDF limits")
-    return q
-
-
-def wrapped_delta(a, b):
-    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
+    return tuple(min(high, max(low, value)) for value, low, high in zip(q, LOWER, UPPER))
 
 
 @dataclass(frozen=True)
 class Command:
     seq: int
-    sent_at: float
     q_arm: tuple
-    received_at: float
-    initial_age: float
-
-    def age(self, now):
-        return self.initial_age + max(0., now - self.received_at)
+    tau_arm: tuple
 
 
-def validate_command(packet, wall_now, now, last_seq, max_age=0.3):
+def parse_command(packet):
     if not isinstance(packet, dict):
         raise ValueError("command must be an object")
-    seq, stamp = packet.get("seq"), packet.get("sent_at")
-    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0 or seq <= last_seq:
-        raise ValueError("seq must increase strictly")
-    if not finite(stamp) or not -0.05 <= wall_now - stamp <= max_age:
-        raise ValueError("stale/future command timestamp")
+    seq = packet.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        raise ValueError("seq must be an integer")
     tau = vector(packet.get("tau_arm", [0.] * 14), 14, "tau_arm")
-    if any(value != 0 for value in tau):
-        raise ValueError("initial commissioning accepts zero feedforward torque only")
-    return Command(seq, float(stamp), arm_positions(packet.get("q_arm")), now, max(0., wall_now - stamp))
+    tau = tuple(min(TAU_LIMIT, max(-TAU_LIMIT, value)) for value in tau)
+    return Command(seq, arm_positions(packet.get("q_arm")), tau)
 
 
 class Mailbox:
-    """Latest only; malformed input and EOF latch a fault and cannot re-enable."""
-    def __init__(self, max_age=0.3):
+    """Latest good command wins; bad or out-of-order packets are counted and skipped."""
+    def __init__(self):
         self.lock = threading.Lock()
-        self.max_age = max_age
         self.command = None
         self.last_seq = -1
-        self.fault = None
+        self.rejected = 0
+        self.last_error = None
+        self.eof = False
 
-    def fail(self, reason):
+    def ingest(self, packet):
+        try:
+            command = parse_command(packet)
+        except ValueError as exc:
+            with self.lock:
+                self.rejected += 1
+                self.last_error = str(exc)
+            return False
         with self.lock:
-            self.fault = self.fault or reason
-            self.command = None
-
-    def ingest(self, packet, wall_now, now):
-        with self.lock:
-            if self.fault:
+            if command.seq <= self.last_seq:
                 return False
-            try:
-                self.command = validate_command(packet, wall_now, now, self.last_seq, self.max_age)
-            except ValueError as exc:
-                self.fault = "invalid_command: " + str(exc)
-                self.command = None
-                return False
-            self.last_seq = self.command.seq
-            return True
+            self.command, self.last_seq = command, command.seq
+        return True
 
-    def snapshot(self, now):
+    def mark_eof(self):
         with self.lock:
-            age = None if self.command is None else self.command.age(now)
-            command = self.command if age is not None and age <= self.max_age and not self.fault else None
-            return command, age, self.fault
+            self.eof = True
+
+    def snapshot(self):
+        with self.lock:
+            return self.command, self.eof
 
 
 def read_commands(stream, mailbox, stop):
@@ -123,208 +111,130 @@ def read_commands(stream, mailbox, stop):
                 continue
             chunk = os.read(fd, 16384)
             if not chunk:
-                mailbox.fail("stdin_eof")
                 return
             pending += chunk
             if len(pending) > 65536:
-                mailbox.fail("input_record_too_large")
-                return
+                pending = pending[pending.rfind(b"\n") + 1:] if b"\n" in pending else b""
             while b"\n" in pending:
                 line, pending = pending.split(b"\n", 1)
                 try:
                     packet = json.loads(line)
                 except (ValueError, UnicodeError):
-                    mailbox.fail("invalid_json")
-                    return
-                if not mailbox.ingest(packet, time.time(), time.monotonic()):
-                    return
-    except Exception as exc:
-        mailbox.fail("stdin_error: " + str(exc))
+                    mailbox.ingest(None)
+                    continue
+                mailbox.ingest(packet)
+    except Exception:
+        pass
+    finally:
+        mailbox.mark_eof()
 
 
 class StateGate:
-    """Duplicate ticks never refresh receipt age; active faults are latched."""
-    def __init__(self, expected_mode=6, state_max_age=.1, quiet_speed=.05, body_limit=.05):
-        self.expected_mode = expected_mode
-        self.state_max_age = state_max_age
-        self.quiet_speed = quiet_speed
-        self.body_limit = body_limit
+    """Latest lowstate for telemetry and engagement; duplicate ticks are skipped."""
+    def __init__(self):
         self.state = None
         self.received_at = None
-        self.stable_frames = 0
         self.duplicates = 0
+        self.invalid = 0
         self.fsm_id = None
-        self.fsm_received = None
-        self.fsm_error = None
-        self.engaged = False
-        self.fault = None
-        self.immediate = False
-        self.reason = "waiting_for_state"
-        self.baseline = None
-        self.initial_arm = self.target = None
 
-    def fail(self, reason, immediate=True):
-        self.stable_frames = 0
-        self.reason = reason
-        if self.engaged:
-            self.fault = self.fault or reason
-            self.immediate = self.immediate or immediate
-
-    def update_fsm(self, code, fsm_id, now):
-        self.fsm_id = fsm_id if isinstance(fsm_id, int) and not isinstance(fsm_id, bool) else None
-        self.fsm_received = now
-        self.fsm_error = None if code == 0 and self.fsm_id == EXPECTED_FSM else "native_fsm_not_500"
-        if self.fsm_error and self.engaged:
-            self.fail(self.fsm_error)
+    def update_fsm(self, code, fsm_id):
+        self.fsm_id = fsm_id if code == 0 and isinstance(fsm_id, int) and not isinstance(fsm_id, bool) else None
 
     def update(self, packet, now, wall_now):
         try:
-            q = arm_positions(packet["q_arm"])
+            q = vector(packet["q_arm"], 14, "q_arm")
             dq = vector(packet["dq_arm"], 14, "dq_arm")
             tau = vector(packet.get("tau_arm", [0.] * 14), 14, "tau_arm")
             waist = vector(packet["q_waist"], 3, "q_waist")
             imu = vector(packet["imu_rpy"], 3, "imu_rpy")
             tick = packet["tick"]
-            if not isinstance(tick, int) or isinstance(tick, bool) or not 0 <= tick < 2**32:
-                raise ValueError("invalid tick")
-            if packet["mode_machine"] != self.expected_mode or packet["mode_pr"] != 0:
-                raise ValueError("mode_machine/mode_pr changed")
-            if list(packet["arm_mode"]) != [1] * 14 or list(packet["arm_status"]) != [0] * 14:
-                raise ValueError("arm motor mode/status invalid")
-            if self.state is not None:
-                advance = (tick - self.state["tick"]) & 0xFFFFFFFF
-                if advance == 0:
-                    self.duplicates += 1
-                    return False
-                if advance >= 2**31:
-                    raise ValueError("lowstate tick moved backwards")
-            if self.received_at is not None and now - self.received_at > self.state_max_age:
-                self.fail("stale_lowstate_gap", immediate=False)
-            if self.engaged and self.baseline is not None:
-                if any(wrapped_delta(a, b) > self.body_limit for a, b in zip(waist + imu, self.baseline)):
-                    raise ValueError("waist_or_imu_drift")
-                if max(abs(a - b) for a, b in zip(q, self.initial_arm)) > .25:
-                    raise ValueError("measured_arm_excursion")
-                if max(abs(a - b) for a, b in zip(q, self.target)) > .2:
-                    raise ValueError("arm_tracking_error")
-                if max(abs(value) for value in dq) > .75:
-                    raise ValueError("excessive_arm_velocity")
-            if any(abs(value) > limit for value, limit in zip(tau, MEASURED_TAU_LIMIT)):
-                raise ValueError("excessive_measured_arm_torque")
-        except (ValueError, KeyError, TypeError) as exc:
-            self.fail("invalid_state: " + str(exc))
+        except (ValueError, KeyError, TypeError):
+            self.invalid += 1
+            return False
+        if self.state is not None and tick == self.state["tick"]:
+            self.duplicates += 1
             return False
         self.received_at = now
         self.state = {"q_arm": q, "dq_arm": dq, "tau_arm": tau, "q_waist": waist, "imu_rpy": imu,
-                      "mode_machine": packet["mode_machine"], "mode_pr": 0, "tick": tick,
-                      "timestamp": wall_now}
-        if not self.engaged and max(abs(x) for x in dq) > self.quiet_speed:
-            self.fail("arms_not_quiet")
-        elif not self.fault:
-            self.stable_frames += 1
-            self.reason = "ready" if self.stable_frames >= 10 else "qualifying_state"
-        return self.stable_frames >= 10 and not self.fault
+                      "mode_machine": packet.get("mode_machine"), "mode_pr": packet.get("mode_pr"),
+                      "tick": tick, "timestamp": wall_now}
+        return True
 
-    def engage(self):
-        self.engaged = True
-        self.baseline = self.state["q_waist"] + self.state["imu_rpy"]
-        self.initial_arm = self.target = self.state["q_arm"]
-
-    def snapshot(self, now):
+    def snapshot(self, now, max_age=.5):
         age = None if self.received_at is None else max(0., now - self.received_at)
-        fsm_age = None if self.fsm_received is None else max(0., now - self.fsm_received)
-        if age is None or age > self.state_max_age:
-            self.fail("waiting_for_state" if age is None else "stale_lowstate", immediate=False)
-        fsm_ok = self.fsm_error is None and self.fsm_id == EXPECTED_FSM and fsm_age is not None and fsm_age <= .4
-        if self.engaged and not fsm_ok:
-            self.fail(self.fsm_error or "stale_native_fsm")
-        ready = self.stable_frames >= 10 and not self.fault and fsm_ok
-        result = dict(self.state or {"q_arm": None, "dq_arm": None, "tau_arm": None, "q_waist": None, "imu_rpy": None,
-                                     "mode_machine": None, "mode_pr": None, "tick": None, "timestamp": None})
-        result.update(ready=ready, fsm_id=self.fsm_id, state_age_s=age, fsm_age_s=fsm_age,
-                      stable_frames=self.stable_frames, duplicate_ticks=self.duplicates,
-                      reason=self.fault or (self.reason if fsm_ok else self.fsm_error or "waiting_for_native_fsm"),
-                      fault=self.fault, immediate_release=self.immediate)
+        result = dict(self.state or {"q_arm": None, "dq_arm": None, "tau_arm": None, "q_waist": None,
+                                     "imu_rpy": None, "mode_machine": None, "mode_pr": None,
+                                     "tick": None, "timestamp": None})
+        ready = age is not None and age <= max_age
+        result.update(ready=ready, fsm_id=self.fsm_id, state_age_s=age, duplicate_ticks=self.duplicates,
+                      invalid_states=self.invalid, reason="ready" if ready else
+                      ("waiting_for_state" if age is None else "stale_lowstate"))
         return result
 
 
-def bounded_step(initial, previous, requested, dt, slew=.15, excursion=.15):
-    initial, previous, requested = map(arm_positions, (initial, previous, requested))
-    if not all(finite(x) and x >= 0 for x in (dt, slew, excursion)):
-        raise ValueError("invalid step parameters")
-    output = []
-    for origin, old, target, lower, upper in zip(initial, previous, requested, LOWER, UPPER):
-        low, high = max(lower, origin - excursion), min(upper, origin + excursion)
-        if not low - 1e-9 <= old <= high + 1e-9:
-            raise ValueError("previous target outside excursion envelope")
-        target = min(high, max(low, target))
-        output.append(min(high, max(low, old + max(-slew * dt, min(slew * dt, target - old)))))
-    return tuple(output)
+def velocity_step(previous, requested, max_step):
+    """Upstream clip_arm_q_target: scale the whole move so no joint exceeds max_step."""
+    delta = [target - old for target, old in zip(requested, previous)]
+    scale = max(1., max(abs(value) for value in delta) / max_step) if max_step > 0 else math.inf
+    return tuple(old + value / scale for old, value in zip(previous, delta))
 
 
 class ArmMotion:
-    def __init__(self, q, now, period=.01, slew=.15, excursion=.15, ramp_up=2., release_time=.5):
+    def __init__(self, q, now, ramp_up=1., speed_ramp=3., min_velocity=1., max_velocity=10., release_time=1.):
         self.initial = self.target = arm_positions(q)
         self.started = self.last_step = now
-        self.period, self.slew, self.excursion = period, slew, excursion
-        self.ramp_up, self.release_time = ramp_up, release_time
+        self.ramp_up, self.speed_ramp, self.release_time = ramp_up, speed_ramp, release_time
+        self.min_velocity, self.max_velocity = min_velocity, max_velocity
         self.weight = 0.
         self.phase = "ramp_up_hold"
         self.release_at = None
         self.release_weight = 0.
         self.reason = None
 
+    def velocity_limit(self, now):
+        tracking = now - self.started - self.ramp_up
+        fraction = min(1., max(0., tracking / self.speed_ramp)) if self.speed_ramp > 0 else 1.
+        return self.min_velocity + (self.max_velocity - self.min_velocity) * fraction
+
     def release(self, now, reason, immediate=False):
         self.reason = self.reason or reason
         if self.phase == "released":
-            return  # Irrevocable: finally/repeated requests must never restore weight.
+            return
         if self.release_at is None:
             self.release_at, self.release_weight = now, self.weight
         self.phase = "releasing"
         if immediate:
-            self.weight = 0.
-            self.phase = "released"
+            self.weight, self.phase = 0., "released"
 
     def step(self, now, requested=None):
-        dt = min(self.period, max(0., now - self.last_step))
+        dt = min(.02, max(0., now - self.last_step))
         self.last_step = now
         if self.phase == "released":
             return
         if self.release_at is not None:
-            self.weight = min(self.weight, max(0., self.release_weight * (1. - max(0., now - self.release_at) / self.release_time)))
+            elapsed = max(0., now - self.release_at)
+            self.weight = max(0., self.release_weight * (1. - elapsed / self.release_time)) if self.release_time > 0 else 0.
             if self.weight <= 0:
                 self.phase = "released"
             return
         if now - self.started < self.ramp_up:
             self.weight = min(1., max(0., (now - self.started) / self.ramp_up))
-            return  # Keep the measured startup posture during weight ramp.
-        self.weight = 1.
-        self.phase = "tracking"
+            return  # Hold the measured startup posture while the overlay weight ramps in.
+        self.weight, self.phase = 1., "tracking"
         if requested is not None:
-            self.target = bounded_step(self.initial, self.target, requested, dt, self.slew, self.excursion)
+            self.target = velocity_step(self.target, arm_positions(requested), self.velocity_limit(now) * dt)
 
 
-def build_message(factory, crc, q, weight, mode_machine=6, feedback=None):
+def build_message(factory, crc, q, weight, mode_machine=0, tau=None):
     q = arm_positions(q)
-    if not finite(weight) or not 0 <= weight <= 1:
-        raise ValueError("invalid overlay weight")
-    if weight > 0:
-        if feedback is None:
-            raise ValueError("positive weight requires fresh feedback for PD estimate")
-        observed = arm_positions(feedback["q_arm"])
-        velocity = vector(feedback["dq_arm"], 14, "dq_arm")
-        for i, (target, actual, speed, limit) in enumerate(zip(q, observed, velocity, PD_LIMIT)):
-            kp = 40. if i % 7 >= 4 else 60.
-            if abs(kp * (target - actual) - 1.5 * speed) > limit:
-                raise ValueError("estimated_PD_effort_exceeded at arm joint " + str(i))
+    tau = (0.,) * 14 if tau is None else tau
     message = factory()  # fresh all-zero legs, waist and unused slots each tick
-    message.mode_pr, message.mode_machine = 0, mode_machine
-    for index, value in zip(ARM_INDICES, q):
+    message.mode_pr, message.mode_machine = 0, int(mode_machine or 0)
+    for index, value, effort, kp, kd in zip(ARM_INDICES, q, tau, KP, KD):
         motor = message.motor_cmd[index]
-        motor.mode, motor.q, motor.dq, motor.tau = 1, value, 0., 0.
-        motor.kp = 40. if (index - 15) % 7 >= 4 else 60.
-        motor.kd = 1.5
-    message.motor_cmd[WEIGHT_INDEX].q = weight
+        motor.mode, motor.q, motor.dq, motor.tau, motor.kp, motor.kd = 1, value, 0., float(effort), kp, kd
+    message.motor_cmd[WEIGHT_INDEX].q = min(1., max(0., float(weight)))
     message.crc = crc.Crc(message)
     return message
 
@@ -356,68 +266,47 @@ def parse_args(argv=None):
     from teleop_config import load_config
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--expected-mode-machine", type=int)
     parser.add_argument("--interface", default=load_config()['G1_ARM_INTERFACE'])
-    parser.add_argument("--duration", type=float)
-    parser.add_argument("--rate", type=int, choices=(100, 250), default=100)
-    parser.add_argument("--max-age", type=float, default=.3)
-    parser.add_argument("--state-max-age", type=float, default=.1)
-    parser.add_argument("--slew-rate", type=float, default=.15)
-    parser.add_argument("--max-excursion", type=float, default=.15)
-    parser.add_argument("--ramp-up", type=float, default=2.)
-    parser.add_argument("--release-time", type=float, default=.5)
-    parser.add_argument("--startup-timeout", type=float, default=10.)
+    parser.add_argument("--duration", type=float, default=0., help="seconds; 0 runs until stdin EOF or a signal")
+    parser.add_argument("--rate", type=int, choices=(100, 250), default=250)
+    parser.add_argument("--state-max-age", type=float, default=.5)
+    parser.add_argument("--min-velocity", type=float, default=1., help="rad/s velocity limit right after engagement")
+    parser.add_argument("--max-velocity", type=float, default=10., help="rad/s velocity limit after --speed-ramp")
+    parser.add_argument("--speed-ramp", type=float, default=3.)
+    parser.add_argument("--ramp-up", type=float, default=1., help="overlay weight ramp-in seconds")
+    parser.add_argument("--release-time", type=float, default=1., help="overlay weight ramp-out seconds")
     args = parser.parse_args(argv)
-    if args.execute and args.expected_mode_machine != 6:
-        parser.error("--execute requires explicit --expected-mode-machine 6")
-    if args.expected_mode_machine is None:
-        args.expected_mode_machine = 6
-    if args.expected_mode_machine != 6:
-        parser.error("only the verified mode_machine 6 is supported")
-    if args.duration is None:
-        args.duration = 30. if args.execute else 15.
-    for key in ("duration", "max_age", "state_max_age", "slew_rate", "max_excursion", "ramp_up", "release_time", "startup_timeout"):
-        if not finite(getattr(args, key)) or getattr(args, key) <= 0:
-            parser.error(key + " must be finite and positive")
-    if args.duration > 120 or args.release_time > 1 or args.release_time >= args.duration:
-        parser.error("duration <=120s, release-time <=1s and shorter than duration are required")
-    if args.max_age > .3 or args.state_max_age > .1 or args.max_excursion > .15 or args.slew_rate > .15:
-        parser.error("initial commissioning limits cannot be increased")
+    for key in ("duration", "state_max_age", "min_velocity", "max_velocity", "speed_ramp", "ramp_up", "release_time"):
+        if not finite(getattr(args, key)) or getattr(args, key) < 0:
+            parser.error(key + " must be finite and nonnegative")
     return args
 
 
-def release_transport(publisher, factory, crc, motion, mode, period, output, safety_snapshot=None):
-    """Best-effort bounded release in finally, including after publish exceptions."""
+def release_transport(publisher, factory, crc, motion, mode_machine, period, output):
+    """Ramp the overlay weight out at the last target, then send zero weight."""
     if publisher is None or motion is None:
         return 0
-    now = time.monotonic()
-    motion.release(now, motion.reason or "cleanup")
-    deadline = now + motion.release_time
+    motion.release(time.monotonic(), motion.reason or "cleanup")
+    deadline = time.monotonic() + motion.release_time + .5
     writes = 0
-    while time.monotonic() <= deadline and motion.phase != "released":
-        feedback = safety_snapshot() if safety_snapshot is not None else None
-        if feedback is None or feedback["immediate_release"] or not feedback.get("ready", False):
-            motion.release(time.monotonic(), motion.reason or "state_changed_during_release", immediate=True)
+    while motion.phase != "released" and time.monotonic() <= deadline:
         motion.step(time.monotonic())
         try:
-            if publisher.Write(build_message(factory, crc, motion.target, motion.weight, mode, feedback)) is not False:
+            if publisher.Write(build_message(factory, crc, motion.target, motion.weight, mode_machine())) is not False:
                 writes += 1
         except Exception:
-            motion.release(time.monotonic(), motion.reason or "release_write_error", immediate=True)
+            pass
         time.sleep(period)
     motion.release(time.monotonic(), motion.reason or "cleanup", immediate=True)
-    zero_writes = 0
     for _ in range(3):
         try:
-            if publisher.Write(build_message(factory, crc, motion.target, 0., mode)) is not False:
+            if publisher.Write(build_message(factory, crc, motion.target, 0., mode_machine())) is not False:
                 writes += 1
-                zero_writes += 1
         except Exception:
             pass
         time.sleep(period)
     output.emit("status", status="released", ready=False, weight=0., reason=motion.reason,
-                release_write_successes=writes, zero_weight_writes=zero_writes,
-                note="weight is commanded; DDS write success does not acknowledge native handoff")
+                release_writes=writes)
     return writes
 
 
@@ -438,17 +327,16 @@ def main(argv=None):
     execute_lock = acquire_execute_lock() if args.execute else None
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-    from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
     ChannelFactoryInitialize(0, networkInterface=args.interface)
     output = JsonOutput()
-    gate = StateGate(args.expected_mode_machine, args.state_max_age)
+    gate = StateGate()
     lock = threading.Lock()
-    mailbox = Mailbox(args.max_age)
+    mailbox = Mailbox()
     stop = threading.Event()
     requested_stop = threading.Event()
     subscriber = publisher = motion = reader = fsm_thread = None
     factory = crc = None
-    published = 0
+    published = write_failures = 0
     result = 0
     started = time.monotonic()
     period = 1. / args.rate
@@ -461,82 +349,69 @@ def main(argv=None):
         with lock:
             try:
                 motors = message.motor_state
-                if len(motors) != 35:
-                    raise ValueError("expected 35 lowstate motors")
-                packet = {"q_arm": [motors[i].q for i in ARM_INDICES],
-                          "dq_arm": [motors[i].dq for i in ARM_INDICES],
-                          "tau_arm": [motors[i].tau_est for i in ARM_INDICES],
-                          "arm_mode": [motors[i].mode for i in ARM_INDICES],
-                          "arm_status": [motors[i].motorstate for i in ARM_INDICES],
-                          "q_waist": [motors[i].q for i in (12, 13, 14)],
-                          "imu_rpy": list(message.imu_state.rpy), "tick": message.tick,
-                          "mode_machine": message.mode_machine, "mode_pr": message.mode_pr}
-                gate.update(packet, time.monotonic(), time.time())
-            except Exception as exc:
-                gate.fail("invalid_state: " + str(exc))
+                gate.update({"q_arm": [motors[i].q for i in ARM_INDICES],
+                             "dq_arm": [motors[i].dq for i in ARM_INDICES],
+                             "tau_arm": [motors[i].tau_est for i in ARM_INDICES],
+                             "q_waist": [motors[i].q for i in (12, 13, 14)],
+                             "imu_rpy": list(message.imu_state.rpy), "tick": message.tick,
+                             "mode_machine": message.mode_machine, "mode_pr": message.mode_pr},
+                            time.monotonic(), time.time())
+            except Exception:
+                gate.invalid += 1
 
-    def poll_fsm(client):
+    def poll_fsm():
+        """Telemetry only; the loco service may be absent in debug mode."""
+        try:
+            from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+            client = LocoClient()
+            client.SetTimeout(.15)
+            client.Init()
+        except Exception:
+            return
         while not stop.is_set():
             try:
-                code, fsm_id = client.GetFsmId()  # Read-only API; no SetFsmId calls.
+                code, fsm_id = client.GetFsmId()
             except Exception:
                 code, fsm_id = -1, None
             with lock:
-                gate.update_fsm(code, fsm_id, time.monotonic())
-            stop.wait(.1)
+                gate.update_fsm(code, fsm_id)
+            stop.wait(.5)
 
-    def safety_snapshot():
+    def mode_machine():
         with lock:
-            return gate.snapshot(time.monotonic())
+            return (gate.state or {}).get("mode_machine") or 0
 
     try:
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             previous_handlers[sig] = signal.signal(sig, signal_stop)
         subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         subscriber.Init(state_callback)
-        client = LocoClient()
-        client.SetTimeout(.15)
-        client.Init()
-        fsm_thread = threading.Thread(target=poll_fsm, args=(client,), daemon=True)
+        fsm_thread = threading.Thread(target=poll_fsm, daemon=True)
         fsm_thread.start()
         if args.execute:
             reader = threading.Thread(target=read_commands, args=(sys.stdin, mailbox, stop), daemon=True)
             reader.start()
         output.emit("status", status="started", mode="execute" if args.execute else "read_only",
-                    duration_s=args.duration, rate_hz=args.rate, expected_mode_machine=6, expected_fsm=500,
-                    max_excursion_rad=args.max_excursion, slew_rad_s=args.slew_rate,
-                    actual_excursion_limit_rad=.25, tracking_error_limit_rad=.2, velocity_limit_rad_s=.75,
-                    estimated_pd_limits_nm=PD_LIMIT, measured_tau_limits_nm=MEASURED_TAU_LIMIT,
-                    effort_note="software estimate/feedback gates; no physical torque guarantee",
-                    body_drift_limit_rad=.05, nonarm_fields="all zero; body immobility is not guaranteed")
+                    duration_s=args.duration, rate_hz=args.rate, min_velocity_rad_s=args.min_velocity,
+                    max_velocity_rad_s=args.max_velocity, speed_ramp_s=args.speed_ramp, kp=KP, kd=KD)
         next_report = started
         while True:
             now = time.monotonic()
             with lock:
-                state = gate.snapshot(now)
-            command, command_age, input_fault = mailbox.snapshot(now)
-            duration_done = now >= started + args.duration - (args.release_time if args.execute else 0.)
+                state = gate.snapshot(now, args.state_max_age)
+            command, eof = mailbox.snapshot()
             reason = None
-            immediate = False
             if requested_stop.is_set():
                 reason = "requested_stop"
+            elif args.execute and eof:
+                reason = "stdin_eof"
             elif output.closed:
                 reason = "stdout_disconnected"
-            elif args.execute and input_fault:
-                reason = input_fault
-            elif motion is not None and state["fault"]:
-                reason, immediate = state["fault"], state["immediate_release"]
-            elif motion is not None and command is None:
-                reason = "stale_command"
-            elif duration_done:
+            elif args.duration and now - started >= args.duration:
                 reason = "duration_complete"
-            elif motion is None and args.execute and now - started > args.startup_timeout:
-                reason = "startup_timeout"
             if reason:
-                if reason not in ("duration_complete", "requested_stop"):
-                    result = 2
                 if motion is not None:
-                    motion.release(now, reason, immediate)
+                    motion.release(now, reason)
                 output.emit("status", status="release_requested" if motion else "stopped",
                             ready=False, reason=reason, weight=motion.weight if motion else 0.)
                 break
@@ -549,37 +424,27 @@ def main(argv=None):
                     factory, crc = unitree_hg_msg_dds__LowCmd_, CRC()
                     publisher = ChannelPublisher("rt/arm_sdk", LowCmd_)
                     publisher.Init()
-                    continue  # Init waits; recheck both sources before any write.
-                with lock:
-                    state = gate.snapshot(time.monotonic())
-                    if state["ready"]:
-                        gate.engage()
-                        motion = ArmMotion(state["q_arm"], time.monotonic(), period, args.slew_rate,
-                                           args.max_excursion, args.ramp_up, args.release_time)
-                if motion is not None:
-                    output.emit("status", status="engaged_measured_hold", ready=True, weight=0.,
-                                initial_q=motion.initial, q_waist=state["q_waist"], imu_rpy=state["imu_rpy"])
+                motion = ArmMotion(state["q_arm"], time.monotonic(), args.ramp_up, args.speed_ramp,
+                                   args.min_velocity, args.max_velocity, args.release_time)
+                output.emit("status", status="engaged", ready=True, weight=0., initial_q=motion.initial)
             if motion is not None:
-                # Final checks before positive-weight writes; callback faults latch.
-                with lock:
-                    checked = gate.snapshot(time.monotonic())
-                latest, _, fault = mailbox.snapshot(time.monotonic())
-                if checked["fault"] or not checked["ready"] or latest is None or fault:
-                    motion.release(time.monotonic(), checked["fault"] or fault or "stale_before_write",
-                                   checked["immediate_release"])
-                    result = 2
-                    break
-                motion.step(time.monotonic(), latest.q_arm)
-                if publisher.Write(build_message(factory, crc, motion.target, motion.weight, args.expected_mode_machine, checked)) is False:
-                    raise RuntimeError("arm_sdk DDS write failed")
-                published += 1
-                with lock:
-                    gate.target = motion.target
+                motion.step(time.monotonic(), command.q_arm if command else None)
+                tau = command.tau_arm if command and motion.phase == "tracking" else None
+                try:
+                    written = publisher.Write(build_message(factory, crc, motion.target, motion.weight,
+                                                            state["mode_machine"], tau))
+                except Exception:
+                    written = False
+                if written is False:
+                    write_failures += 1
+                else:
+                    published += 1
             if now >= next_report:
                 output.emit("state", **state, mode="execute" if args.execute else "read_only",
                             weight=motion.weight if motion else 0., phase=motion.phase if motion else "waiting",
-                            published_count=published, command_age_s=command_age,
+                            published_count=published, write_failures=write_failures,
                             command_seq=command.seq if command else None,
+                            rejected_commands=mailbox.rejected, last_command_error=mailbox.last_error,
                             q_command=motion.target if motion else None)
                 next_report = now + .5
             output.flush()
@@ -590,10 +455,8 @@ def main(argv=None):
             motion.release(time.monotonic(), "exception: " + str(exc))
         output.emit("error", error=str(exc))
     finally:
-        # Release before stopping state/FSM reception or closing the publisher.
         try:
-            published += release_transport(publisher, factory, crc, motion,
-                                           args.expected_mode_machine, period, output, safety_snapshot)
+            published += release_transport(publisher, factory, crc, motion, mode_machine, period, output)
         finally:
             stop.set()
             for thread in (reader, fsm_thread):

@@ -32,13 +32,6 @@ def packet(tick=1, **changes):
     return result
 
 
-def qualify(gate):
-    gate.update_fsm(0, 500, 0.)
-    for index in range(10):
-        gate.update(packet(index + 1), index * .001, 100. + index * .001)
-    return gate.snapshot(.01)
-
-
 def factory():
     return types.SimpleNamespace(mode_machine=0, mode_pr=0, crc=0,
         motor_cmd=[types.SimpleNamespace(mode=0, q=0., dq=0., tau=0., kp=0., kd=0., reserve=0) for _ in range(35)])
@@ -51,190 +44,83 @@ class Crc:
 
 class UpperBodyTests(unittest.TestCase):
     def test_pinned_limits_and_order_match_urdf(self):
-        joints = {node.attrib['name']: node for node in ET.parse(MODEL_REPO / 'assets/g1/g1_body29_hand14.urdf').getroot().findall('joint')}
+        urdf = MODEL_REPO / 'assets/g1/g1_body29_hand14.urdf'
+        if not urdf.is_file():
+            self.skipTest('upstream checkout missing; run scripts/fetch_upstream.py')
+        joints = {node.attrib['name']: node for node in ET.parse(urdf).getroot().findall('joint')}
         for name, low, high in zip(bridge.JOINT_NAMES, bridge.LOWER, bridge.UPPER):
             limit = joints[name].find('limit')
             self.assertEqual((low, high), (float(limit.attrib['lower']), float(limit.attrib['upper'])))
         self.assertEqual(bridge.ARM_INDICES, tuple(range(15, 29)))
 
-    def test_commands_validate_sequence_age_bounds_and_zero_torque(self):
-        good = {'seq': 1, 'sent_at': 100., 'q_arm': Q}
-        command = bridge.validate_command(good, 100.05, 1., 0)
-        self.assertAlmostEqual(command.age(1.1), .15)
-        bad = [dict(good, seq=0), dict(good, seq=True), dict(good, sent_at=99.),
-               dict(good, sent_at=101.), dict(good, q_arm=[math.nan] * 14),
-               dict(good, q_arm=[0.] * 13), dict(good, q_arm=[10.] * 14),
-               dict(good, tau_arm=[.1] * 14), dict(good, tau_arm=[math.inf] * 14)]
-        for item in bad:
-            with self.subTest(item=item), self.assertRaises(ValueError):
-                bridge.validate_command(item, 100., 1., 0)
+    def test_targets_are_clipped_not_rejected(self):
+        clipped = bridge.arm_positions([10.] * 14)
+        self.assertEqual(clipped, bridge.UPPER)
+        command = bridge.parse_command({'seq': 1, 'q_arm': [-10.] * 14, 'tau_arm': [100.] * 14})
+        self.assertEqual(command.q_arm, bridge.LOWER)
+        self.assertEqual(command.tau_arm, (bridge.TAU_LIMIT,) * 14)
+        for bad in (None, {'seq': True, 'q_arm': Q}, {'seq': 1, 'q_arm': [math.nan] * 14}, {'seq': 1}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                bridge.parse_command(bad)
 
-    def test_mailbox_invalid_is_latched_latest_only(self):
+    def test_mailbox_skips_bad_and_old_packets_and_holds_latest(self):
         box = bridge.Mailbox()
-        for seq in (1, 2):
-            self.assertTrue(box.ingest({'seq': seq, 'sent_at': 100., 'q_arm': Q}, 100., 1.))
-        self.assertEqual(box.snapshot(1.1)[0].seq, 2)
-        self.assertIsNone(box.snapshot(1.31)[0])
-        self.assertFalse(box.ingest({'seq': 2, 'sent_at': 100., 'q_arm': Q}, 100., 1.4))
-        self.assertFalse(box.ingest({'seq': 3, 'sent_at': 100., 'q_arm': Q}, 100., 1.4))
-        self.assertIsNotNone(box.snapshot(1.4)[2])
+        self.assertTrue(box.ingest({'seq': 2, 'q_arm': Q}))
+        self.assertFalse(box.ingest({'seq': 1, 'q_arm': [0.] * 14}))
+        self.assertFalse(box.ingest({'seq': 3, 'q_arm': [math.nan] * 14}))
+        self.assertFalse(box.ingest(None))
+        command, eof = box.snapshot()
+        self.assertEqual((command.seq, eof, box.rejected), (2, False, 2))
+        self.assertTrue(box.ingest({'seq': 4, 'q_arm': Q, 'sent_at': 0.}))  # Any clock skew is accepted.
+        box.mark_eof()
+        self.assertEqual(box.snapshot()[0].seq, 4)
+        self.assertTrue(box.snapshot()[1])
 
-    def test_ten_unique_ticks_and_duplicates_do_not_refresh_age(self):
+    def test_state_gate_skips_duplicates_and_reports_age(self):
         gate = bridge.StateGate()
-        self.assertTrue(qualify(gate)['ready'])
-        for now in (.02, .04, .08, .11, .15):
-            self.assertFalse(gate.update(packet(10), now, 100. + now))
-        self.assertAlmostEqual(gate.received_at, .009)
-        self.assertEqual(gate.duplicates, 5)
-        self.assertFalse(gate.snapshot(.15)['ready'])
+        self.assertFalse(gate.snapshot(0.)['ready'])
+        self.assertTrue(gate.update(packet(1, mode_machine=5, dq_arm=[3.] * 14), 1., 100.))
+        self.assertFalse(gate.update(packet(1), 1.1, 100.1))
+        self.assertTrue(gate.snapshot(1.2)['ready'])
+        self.assertEqual(gate.snapshot(1.2)['duplicate_ticks'], 1)
+        self.assertFalse(gate.snapshot(2.)['ready'])
+        self.assertFalse(gate.update(packet(2, q_arm=[math.nan] * 14), 2., 101.))
+        self.assertEqual(gate.invalid, 1)
 
-    def test_fresh_arrival_after_gap_cannot_hide_stale_active_state(self):
-        gate = bridge.StateGate()
-        qualify(gate)
-        gate.engage()
-        gate.update(packet(11), .2, 100.2)
-        self.assertEqual(gate.snapshot(.2)['fault'], 'stale_lowstate_gap')
-        for tick in range(12, 30):
-            gate.update(packet(tick), .201 + tick * .001, 100.2)
-        self.assertFalse(gate.snapshot(.25)['ready'])
+    def test_velocity_step_scales_whole_move(self):
+        step = bridge.velocity_step((0.,) * 14, (1.,) + (.5,) * 13, .1)
+        self.assertAlmostEqual(step[0], .1)
+        self.assertAlmostEqual(step[1], .05)
+        self.assertEqual(bridge.velocity_step((0.,) * 14, (.05,) * 14, .1), (.05,) * 14)
 
-    def test_quiet_start_and_motor_mode_status_checks(self):
-        for changed in ({'dq_arm': [.1] * 14}, {'arm_mode': [0] * 14},
-                        {'arm_status': [1] * 14}, {'q_arm': [math.nan] * 14}):
-            gate = bridge.StateGate()
-            gate.update_fsm(0, 500, 0.)
-            for tick in range(10):
-                gate.update(packet(tick, **changed), tick * .001, 100.)
-            self.assertFalse(gate.snapshot(.01)['ready'])
-
-    def test_mode_change_duplicate_tick_immediately_latches(self):
-        gate = bridge.StateGate()
-        qualify(gate)
-        gate.engage()
-        gate.update(packet(10, mode_machine=7), .02, 100.02)
-        self.assertTrue(gate.snapshot(.02)['immediate_release'])
-        self.assertIsNotNone(gate.fault)
-        gate.update(packet(11), .03, 100.03)
-        self.assertFalse(gate.snapshot(.03)['ready'])
-
-    def test_fsm_change_or_failure_latches_without_mode_setting(self):
-        for code, fsm in ((0, 1), (-1, None)):
-            gate = bridge.StateGate()
-            qualify(gate)
-            gate.engage()
-            gate.update_fsm(code, fsm, .02)
-            self.assertTrue(gate.snapshot(.02)['immediate_release'])
-            gate.update_fsm(0, 500, .03)
-            self.assertFalse(gate.snapshot(.03)['ready'])
-
-    def test_body_drift_trips_and_yaw_wrap_is_handled(self):
-        self.assertAlmostEqual(bridge.wrapped_delta(math.pi - .01, -math.pi + .01), .02)
-        for changed in ({'q_waist': [.051, 0., 0.]}, {'imu_rpy': [0., .051, 0.]}):
-            gate = bridge.StateGate()
-            qualify(gate)
-            gate.engage()
-            gate.update(packet(11, **changed), .02, 100.02)
-            self.assertIn('waist_or_imu_drift', gate.fault)
-            self.assertTrue(gate.immediate)
-
-    def test_ramp_holds_measured_target_then_slew_and_excursion(self):
-        motion = bridge.ArmMotion(Q, 0.)
-        requested = tuple(q + .5 for q in Q)
-        motion.step(1., requested)
-        self.assertEqual(motion.target, Q)
+    def test_motion_ramps_weight_then_velocity_then_holds_and_releases(self):
+        motion = bridge.ArmMotion(Q, 0., ramp_up=1., speed_ramp=2., min_velocity=1., max_velocity=5., release_time=.5)
+        far = tuple(value + 1. for value in Q)
+        motion.step(.5, far)
+        self.assertEqual((motion.weight, motion.target), (.5, motion.initial))
+        motion.step(1.01, far)
+        self.assertEqual(motion.phase, 'tracking')
+        self.assertAlmostEqual(motion.velocity_limit(2.), 3.)
+        self.assertAlmostEqual(motion.velocity_limit(9.), 5.)
+        before = motion.target
+        motion.step(1.02, None)
+        self.assertEqual(motion.target, before)  # No command holds the last target.
+        motion.release(2., 'test')
+        motion.step(2.25)
         self.assertAlmostEqual(motion.weight, .5)
-        motion.step(10., requested)  # long pause never produces a target catch-up
-        self.assertLessEqual(max(abs(a - b) for a, b in zip(motion.target, Q)), .0015 + 1e-12)
-        for index in range(200):
-            motion.step(10.01 + index * .01, requested)
-        self.assertAlmostEqual(max(abs(a - b) for a, b in zip(motion.target, Q)), .15)
-        target = motion.target
-        motion.release(13., 'stale_command')
-        motion.step(13.5, tuple(Q))
-        self.assertEqual(motion.weight, 0.)
-        self.assertEqual(motion.phase, 'released')
-        self.assertEqual(motion.target, target)
-        motion.step(15., Q)
-        self.assertEqual(motion.weight, 0.)
+        motion.step(2.6)
+        self.assertEqual((motion.weight, motion.phase), (0., 'released'))
+        motion.release(3., 'again')
+        self.assertEqual((motion.weight, motion.reason), (0., 'test'))
 
-    def test_message_populates_only_arm_and_weight_and_crc(self):
-        msg = bridge.build_message(factory, Crc(), Q, .4, feedback=packet())
-        self.assertEqual((msg.mode_pr, msg.mode_machine, msg.crc), (0, 6, 123456))
-        for index, motor in enumerate(msg.motor_cmd):
-            if index in bridge.ARM_INDICES:
-                self.assertEqual(motor.q, Q[index - 15])
-                self.assertEqual(motor.tau, 0.)
-                self.assertEqual(motor.kp, 40. if (index - 15) % 7 >= 4 else 60.)
-            elif index == 29:
-                self.assertEqual(motor.q, .4)
-                self.assertEqual((motor.mode, motor.dq, motor.tau, motor.kp, motor.kd), (0, 0., 0., 0., 0.))
-            else:
-                self.assertTrue(all(value == 0 for value in vars(motor).values()), f'non-arm slot {index} changed')
-
-    def test_release_retries_zero_after_write_exception(self):
-        class Publisher:
-            def __init__(self):
-                self.attempts = []
-            def Write(self, msg):
-                self.attempts.append(msg.motor_cmd[29].q)
-                if len(self.attempts) == 1:
-                    raise RuntimeError('simulated DDS error')
-                return True
-        pub = Publisher()
-        motion = bridge.ArmMotion(Q, time.monotonic() - 3., release_time=.02)
-        motion.step(time.monotonic(), Q)
-        output = mock.Mock()
-        bridge.release_transport(pub, factory, Crc(), motion, 6, .001, output)
-        self.assertEqual(pub.attempts[-3:], [0., 0., 0.])
-        self.assertEqual(motion.target, Q)
-
-    def test_release_mode_change_goes_directly_zero(self):
-        motion = bridge.ArmMotion(Q, time.monotonic() - 3.)
-        motion.step(time.monotonic(), Q)
-        pub = mock.Mock()
-        bridge.release_transport(pub, factory, Crc(), motion, 6, .001, mock.Mock(),
-                                 lambda: {'immediate_release': True})
-        self.assertTrue(all(call.args[0].motor_cmd[29].q == 0 for call in pub.Write.call_args_list))
-
-    def test_immediate_release_then_finally_cannot_restore_positive_weight(self):
-        motion = bridge.ArmMotion(Q, time.monotonic() - 3.)
-        motion.step(time.monotonic(), Q)
-        self.assertEqual(motion.weight, 1.)
-        motion.release(time.monotonic(), 'mode_changed', immediate=True)
-        motion.release(time.monotonic(), 'cleanup')
-        motion.step(time.monotonic())
-        self.assertEqual(motion.phase, 'released')
-        pub = mock.Mock()
-        bridge.release_transport(pub, factory, Crc(), motion, 6, .001, mock.Mock())
-        self.assertTrue(all(call.args[0].motor_cmd[29].q == 0 for call in pub.Write.call_args_list))
-
-    def test_actual_arm_runaway_and_measured_torque_latch(self):
-        changed_q = list(Q)
-        changed_q[0] += .251
-        tracking_q = list(Q)
-        tracking_q[1] += .201
-        torque = [0.] * 14
-        torque[5] = 4.01
-        for changes, reason in (({'q_arm': changed_q}, 'measured_arm_excursion'),
-                                ({'q_arm': tracking_q}, 'arm_tracking_error'),
-                                ({'dq_arm': [.751] * 14}, 'excessive_arm_velocity'),
-                                ({'tau_arm': torque}, 'excessive_measured_arm_torque')):
-            gate = bridge.StateGate()
-            qualify(gate)
-            gate.engage()
-            gate.update(packet(11, **changes), .02, 100.02)
-            self.assertIn(reason, gate.fault)
-            self.assertTrue(gate.immediate)
-
-    def test_estimated_pd_effort_requires_feedback_and_rejects_excess(self):
-        with self.assertRaises(ValueError):
-            bridge.build_message(factory, Crc(), Q, .5)
-        for joint, delta in ((0, .251), (5, .076)):
-            target = list(Q)
-            target[joint] += delta
-            with self.assertRaisesRegex(ValueError, 'estimated_PD_effort'):
-                bridge.build_message(factory, Crc(), target, .5, feedback=packet(dq_arm=[0.] * 14))
-        bridge.build_message(factory, Crc(), Q, 0.)
+    def test_message_populates_only_arm_weight_gains_and_torque(self):
+        message = bridge.build_message(factory, Crc(), Q, .4, 6, tuple(float(i) for i in range(14)))
+        self.assertEqual((message.mode_machine, message.crc, message.motor_cmd[29].q), (6, 123456, .4))
+        for slot, index in enumerate(bridge.ARM_INDICES):
+            motor = message.motor_cmd[index]
+            self.assertEqual((motor.mode, motor.q, motor.tau), (1, Q[slot], float(slot)))
+            self.assertEqual((motor.kp, motor.kd), (40., 1.5) if slot % 7 >= 4 else (80., 3.))
+        self.assertTrue(all(message.motor_cmd[i].kp == 0 for i in range(15)))
 
     def test_execute_lock_rejects_second_owner(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -248,16 +134,12 @@ class UpperBodyTests(unittest.TestCase):
             descriptor = bridge.acquire_execute_lock(path)
             os.close(descriptor)
 
-    def test_cli_readonly_default_explicit_mode_and_caps(self):
+    def test_cli_defaults_run_until_stopped(self):
         args = bridge.parse_args([])
-        self.assertFalse(args.execute)
-        self.assertEqual(args.duration, 15)
-        self.assertEqual(bridge.parse_args(['--duration', '120']).duration, 120)
-        with mock.patch('sys.stderr'):
-            for argv in (['--execute'], ['--execute', '--expected-mode-machine', '7'],
-                         ['--duration', '121'], ['--release-time', '2'], ['--max-excursion', '.3']):
-                with self.assertRaises(SystemExit):
-                    bridge.parse_args(argv)
+        self.assertEqual((args.execute, args.duration, args.rate, args.max_velocity), (False, 0., 250, 10.))
+        self.assertEqual(bridge.parse_args(['--execute', '--max-velocity', '30']).max_velocity, 30.)
+        with mock.patch('sys.stderr'), self.assertRaises(SystemExit):
+            bridge.parse_args(['--max-velocity', '-1'])
 
     def test_import_is_offline(self):
         self.assertFalse(any(name.startswith(('unitree_sdk2py', 'cyclonedds')) for name in sys.modules))
@@ -334,11 +216,11 @@ class MockRuntimeTests(unittest.TestCase):
             module.__dict__.update(values)
             modules[name] = module
         def input_stream(stream, box, stop):
-            box.ingest({'seq': 1, 'sent_at': time.time(), 'q_arm': Q}, time.time(), time.monotonic())
+            box.ingest({'seq': 1, 'sent_at': time.time(), 'q_arm': Q})
             stop.wait(1)
-        argv = ['--duration', '.08', '--release-time', '.02', '--ramp-up', '.02']
+        argv = ['--duration', '.6' if execute else '.08', '--release-time', '.02', '--ramp-up', '.02']
         if execute:
-            argv += ['--execute', '--expected-mode-machine', '6']
+            argv += ['--execute']
         try:
             with tempfile.TemporaryDirectory() as temp:
                 original_acquire = bridge.acquire_execute_lock
@@ -360,23 +242,23 @@ class MockRuntimeTests(unittest.TestCase):
         self.assertEqual(topics, ['rt/lowstate'])
         self.assertTrue(any(m.get('ready') for m in messages))
 
-    def test_execute_exception_finally_releases_and_closes(self):
+    def test_execute_write_failure_continues_then_releases_and_closes(self):
         result, publishers, messages, topics = self.run_mock(True, True)
-        self.assertEqual(result, 1)
+        self.assertEqual(result, 0)
         self.assertEqual(topics, ['rt/lowstate', 'rt/arm_sdk'])
         self.assertTrue(publishers[0].closed)
+        self.assertTrue(any(m.motor_cmd[29].q == 1. for m in publishers[0].messages))
         self.assertEqual([m.motor_cmd[29].q for m in publishers[0].messages[-3:]], [0., 0., 0.])
         self.assertTrue(any(m.get('status') == 'released' for m in messages))
+        self.assertTrue(any(m.get('write_failures') == 1 for m in messages if m['type'] == 'state'))
         self.assertEqual(messages[-1]['weight'], 0.)
 
     def test_readonly_broken_output_exits_without_arm_publisher(self):
         result, publishers, messages, topics = self.run_mock(False, disconnect_output=True)
-        self.assertEqual(result, 2)
         self.assertEqual(publishers, [])
         self.assertEqual(topics, ['rt/lowstate'])
         self.assertTrue(any(m.get('status') == 'stopped' and m.get('reason') == 'stdout_disconnected'
                             for m in messages))
-        self.assertFalse(any(m.get('reason') == 'duration_complete' for m in messages))
         self.assertEqual(messages[-1]['status'], 'finished')
         self.assertEqual(messages[-1]['published_count'], 0)
 

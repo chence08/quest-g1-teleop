@@ -4,7 +4,7 @@
 
 A reproducible upper-body teleoperation integration built on **Unitree xr_teleoperate**. Quest camera-based hand tracking drives calibrated wrist targets and DFX finger retargeting. Arm and hand commands travel over SSH; DDS stays on the robot.
 
-**Status:** bounded DFX-only motion was physically confirmed. Neutral arm calibration and numerical IK passed; **physical arm and combined operation remain uncommissioned** because intermittent Quest tracking stopped the live attempts before any arm motor commands were published. See [commissioning results](docs/COMMISSIONING.md).
+**Status:** this build follows upstream xr_teleoperate behaviour for real, full-range motion: tracking loss, IK failure and late packets hold the last target instead of stopping. **It has no automatic safety stops; keep a person on the physical Unitree remote.** Bounded DFX-only motion was physically confirmed on the earlier, restricted build; full-range arm motion with this build has not yet been run on hardware. See [commissioning results](docs/COMMISSIONING.md).
 
 ## Deployment topology
 
@@ -56,59 +56,40 @@ Generate **new** local certificates for the workstation's Ethernet address, then
 
 No installation command starts robot motion. Follow [robot preparation](docs/ROBOT_SETUP.md) before using robot feedback or execute mode.
 
-## Connect Quest and calibrate
+## Run
 
-Start a read-only arm preview after robot preparation:
+Put the robot in the native mode you want (for example standing, FSM 500) with the Unitree remote; the software does not change modes. Then:
 
 ```bash
-./full_teleop.sh --robot-feedback --arms-only --host-ip YOUR_WORKSTATION_LAN_IP
+./full_teleop.sh --execute --host-ip YOUR_WORKSTATION_LAN_IP
 ```
 
-Open the **complete** URL shown in the terminal in Quest Browser:
+Add `--arms-only` to leave the fingers out, or drop `--execute` for a hardware-free preview. Open the **complete** URL shown in the terminal in Quest Browser:
 
 ```text
 https://YOUR_WORKSTATION_LAN_IP:8012/?ws=wss://YOUR_WORKSTATION_LAN_IP:8012
 ```
 
-For the certificate generated on your own workstation, resolve the local trust warning on the headset. Select the page's **Pass-through** button and allow hand tracking. Both hands must be visible. Hidden grid/hand graphics are intentional; the terminal's fresh tracking status determines readiness.
-
-The robot must already be in the expected native mode: **FSM 500, mode_machine 6** on the observed configuration. Use the normal Unitree remote procedure; the helper does not change modes. Coordinate exclusive control: the conflict scan blocks known competing controllers but cannot discover every possible DDS publisher.
-
-All controls are typed in the workstation terminal and require Enter:
+Resolve the local certificate warning, select the page's **Pass-through** button and allow hand tracking. All controls are typed in the workstation terminal and require Enter:
 
 | Key | Action |
 | --- | --- |
-| `c` | Capture a comfortable neutral wrist pose against measured robot joint positions |
-| `r` | Request one bounded run; requires execute mode, calibration and fresh inputs |
-| `p` | Release the arm overlay to the native controller, stop hand targets and clear calibration |
+| `r` | Start a run. Calibrates first if needed: your current wrist pose maps to the measured robot arm pose |
+| `c` | Recalibrate at the current pose, also while running |
+| `p` | Pause: hand the arms back to the native controller (they move to its pose); `r` resumes with the same calibration |
 | `q` | Exit and clean up owned processes |
 
-Calibration causes no motion. Head yaw and origin are fixed at calibration so looking around does not steer the arms. After release, a new `c → r` is required. **`p` is a native-controller handover, not an emergency stop or pose hold.**
+Head yaw is frozen at calibration so looking around does not steer the arms. A run lasts until `p` or `q` (or `--duration SECONDS`).
 
-## Commission arms, then combine fingers
+## Motion behaviour
 
-First use the restricted arms-only profile. Keep both hands visible and move one wrist a few centimetres at a time:
+- 14 arm joints through `rt/arm_sdk`, plus DFX fingers. No locomotion, waist or balance commands.
+- 1:1 wrist translation within 1 m of the calibration pose; targets are clipped only to URDF joint limits.
+- The robot bridge ramps the overlay weight in over 1 s, then raises the joint velocity limit from 1 to 10 rad/s over 3 s (upstream: 20–30 rad/s). Gains match upstream: kp 80 / kd 3, wrists kp 40 / kd 1.5. IK model gravity torque is sent as feedforward (`--zero-feedforward` disables it).
+- Tracking dropouts (hand packets older than 0.5 s), IK failures, SSH backpressure and malformed packets hold the last target. Mode, FSM, torque, drift and clock checks were removed.
+- If the DFX service or hand bridge fails, arms keep running and the hand bridge restarts. A detected competing controller produces a warning, not a refusal.
 
-```bash
-./full_teleop.sh --execute --arms-only --host-ip YOUR_WORKSTATION_LAN_IP \
-  --duration 20 --translation-limit .04 --rotation-limit .15
-```
-
-After measured feedback and the observer confirm correct arm motion and handover, repeat calibration for the combined test:
-
-```bash
-./full_teleop.sh --execute --host-ip YOUR_WORKSTATION_LAN_IP --duration 30
-```
-
-`--execute` enables `c → r`; it never auto-arms. The launcher owns a passive DFX service for a combined session. It starts target streams only after explicit arming. The service deadline defaults to 10 minutes; use the [operating guide](docs/OPERATING.md) for longer unarmed preparation, finger ordering, limits, troubleshooting and optional camera setup.
-
-## What is bounded
-
-- Only 14 arm joints through `rt/arm_sdk`, plus DFX fingers. No locomotion, waist trajectory or balance controller is provided.
-- First commands require 0.5 seconds of fresh tracking and ready feedback; engagement ramps over two seconds at the measured starting posture.
-- Arm targets: ±0.15 rad per joint, 0.15 rad/s slew. Tracking ages: 250 ms hands / 300 ms head. Robot-local feedback, torque-estimate, mode and body-drift checks remain active.
-- Any command write attempt activates latched fault handling. Tracking loss, stale input, invalid IK or transport failure releases both command streams; there is no automatic rearm.
-- Feedforward model torque is zero. DFX inertia, full-range motion, contact control and freestanding balance are not validated. These software guards are not a certified safety system or a full collision model.
+See the [operating guide](docs/OPERATING.md) for tuning flags and troubleshooting.
 
 ## Development
 
@@ -116,8 +97,8 @@ After measured feedback and the observer confirm correct arm motion and handover
 ./run_python.sh -m unittest discover -s tests -v
 ```
 
-Tests use synthetic data and mocked transports; camera protocol tests bind only local sockets. Never use a successful unit test or DDS write as proof of physical commissioning. Generated certificates, local configuration, recordings and reports are ignored by Git.
+Tests use synthetic data and mocked transports; camera protocol tests bind only local sockets. A passing unit test does not prove physical behaviour. Generated certificates, local configuration, recordings and reports are ignored by Git.
 
-The publication build passed a fresh CPU environment install, all 92 Python tests, synthetic arm IK and finger retargeting, and six serial-emulator scenarios including 100 delayed/fragmented write-read cycles. GitHub Actions runs the lightweight transport, lifecycle, configuration, bootstrap and serial checks; the full numerical smoke check runs locally with the installed environment.
+GitHub Actions runs the lightweight transport, lifecycle, configuration, bootstrap and serial checks; the full numerical smoke check runs locally with the installed environment.
 
 [Architecture](docs/ARCHITECTURE.md) · [Commissioning record](docs/COMMISSIONING.md) · [Third-party notices](THIRD_PARTY_NOTICES.md) · [Apache-2.0](LICENSE)

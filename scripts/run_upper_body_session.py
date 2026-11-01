@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""One-command bounded Quest teleoperation session with owned service cleanup.
+"""One-command Quest teleoperation session with owned service cleanup.
 
-No flags means hardware-free preview. --execute permits c/r arming in the
-sender, but refuses known controller processes or a bridge listening on port 5602.
-These point-in-time checks do not establish exclusive ownership of the robot.
-An explicit --camera-device optionally starts RGB capture and SSH forwarding.
+No flags means hardware-free preview. --execute lets r drive the robot; it warns
+about known competing controllers but does not refuse to start. An explicit
+--camera-device optionally starts RGB capture and SSH forwarding.
 """
 import argparse
 import json
@@ -148,20 +147,18 @@ def parse_args(argv=None):
     parser.add_argument('--arms-only', action='store_true')
     parser.add_argument('--ssh-host', default=config['G1_SSH_HOST'])
     parser.add_argument('--host-ip', default=config['HOST_LAN_IP'])
-    parser.add_argument('--duration', type=float, default=30., help='each explicitly armed run, max120s')
-    parser.add_argument('--session-duration', type=float, default=600., help='whole session/service lifetime, max900s')
+    parser.add_argument('--duration', type=float, default=0., help='seconds per run; 0 runs until p or q')
+    parser.add_argument('--session-duration', type=float, default=4 * 3600., help='whole session/service lifetime, s')
     parser.add_argument('--camera-device', help='explicit /dev/ camera path; starts optional RGB service')
     parser.add_argument('--report', type=Path, default=ROOT / 'reports/upper-body-session.json')
     args, extra = parser.parse_known_args(argv)
     validate_host_ip(parser, args.host_ip, args.execute)
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+', args.ssh_host) or args.ssh_host.startswith('-'):
         parser.error('Invalid SSH host')
-    if not math.isfinite(args.duration) or not 0 < args.duration <= 120:
-        parser.error('--duration must be in (0,120]')
-    if not math.isfinite(args.session_duration) or not 30 <= args.session_duration <= 900:
-        parser.error('--session-duration must be in [30,900]')
-    if args.duration + 15 > args.session_duration:
-        parser.error('--session-duration must exceed --duration by at least15seconds')
+    if not math.isfinite(args.duration) or args.duration < 0:
+        parser.error('--duration must be nonnegative')
+    if not math.isfinite(args.session_duration) or args.session_duration < 30:
+        parser.error('--session-duration must be at least 30 seconds')
     if args.camera_device and not args.camera_device.startswith('/dev/'):
         parser.error('--camera-device must be an explicit /dev/ path')
     args.report = args.report.expanduser().resolve()
@@ -173,8 +170,7 @@ def parse_args(argv=None):
 def sender_command(args, extra):
     command = [str(ROOT / 'run_python.sh'), str(ROOT / 'scripts/quest_upper_body.py'),
                '--ssh-host', args.ssh_host, '--host-ip', args.host_ip,
-               '--duration', str(args.duration), '--wait-timeout', str(args.session_duration),
-               '--report', str(args.report)]
+               '--duration', str(args.duration), '--report', str(args.report)]
     if args.execute: command.append('--execute')
     if args.robot_feedback: command.append('--robot-feedback')
     if args.arms_only: command.append('--arms-only')
@@ -209,34 +205,51 @@ def main(argv=None):
                  'services': [], 'cleanup_order': 'sender release, service EOF/TERM, tunnel close'}
     try:
         if args.execute:
-            checked = subprocess.run(remote_runner_command(args), capture_output=True, text=True, timeout=15)
-            print(checked.stdout.strip(), flush=True)
-            require_clear_conflict_check(checked.stdout, checked.returncode)
+            try:
+                checked = subprocess.run(remote_runner_command(args), capture_output=True, text=True, timeout=15)
+                require_clear_conflict_check(checked.stdout, checked.returncode)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                lifecycle['conflict_warning'] = str(exc)
+                print('WARNING: another arm controller may be running on the robot: ' + str(exc), flush=True)
         if args.execute and not args.arms_only:
-            service = OwnedService(args, 'hands'); services.append(service); service.wait_started()
+            service = OwnedService(args, 'hands'); services.append(service)
+            try:
+                service.wait_started()
+            except RuntimeError as exc:
+                lifecycle['hands_warning'] = str(exc)
+                print('WARNING: ' + str(exc) + '; continuing with arms only.', flush=True)
+                extra = [*extra, '--arms-only']
         if args.camera_device:
-            check_free_local_ports()
-            service = OwnedService(args, 'camera'); services.append(service); service.wait_started()
-            command = ssh_base(args.ssh_host)
-            command[-1:-1] = ['-N', '-L', '127.0.0.1:55555:127.0.0.1:55555', '-L', '127.0.0.1:60000:127.0.0.1:60000']
-            tunnel = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
-            if interrupted.wait(.5) or tunnel.poll() is not None:
-                raise RuntimeError('Camera SSH tunnel did not remain open')
-            lifecycle['camera_verified'] = check_camera_frame()
-            print('Camera frame verified through the owned SSH tunnel.', flush=True)
+            try:
+                check_free_local_ports()
+                service = OwnedService(args, 'camera'); services.append(service); service.wait_started()
+                command = ssh_base(args.ssh_host)
+                command[-1:-1] = ['-N', '-L', '127.0.0.1:55555:127.0.0.1:55555', '-L', '127.0.0.1:60000:127.0.0.1:60000']
+                tunnel = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
+                if interrupted.wait(.5) or tunnel.poll() is not None:
+                    raise RuntimeError('Camera SSH tunnel did not remain open')
+                lifecycle['camera_verified'] = check_camera_frame()
+                print('Camera frame verified through the owned SSH tunnel.', flush=True)
+            except Exception as exc:
+                lifecycle['camera_warning'] = str(exc)
+                print('WARNING: camera unavailable (' + str(exc) + '); continuing with Pass-through.', flush=True)
+                args.camera_device = None
         if interrupted.is_set():
             raise KeyboardInterrupt
-        print('Starting preview. c calibrates, r arms, p releases, q exits. Each key requires Enter.', flush=True)
+        print('Starting. c calibrates, r runs, p pauses, q exits. Each key requires Enter.', flush=True)
         sender = subprocess.Popen(sender_command(args, extra), cwd=ROOT, start_new_session=True)
         while sender.poll() is None:
             if interrupted.wait(.2):
                 lifecycle['stop_reason'] = 'operator_signal'; result = 130; break
             if time.monotonic() - started >= args.session_duration - 10:
                 lifecycle['stop_reason'] = 'session_deadline'; result = 0; break
-            if any(service.process.poll() is not None for service in services):
-                lifecycle['stop_reason'] = 'owned_service_exited'; break
-            if tunnel is not None and tunnel.poll() is not None:
-                lifecycle['stop_reason'] = 'camera_tunnel_exited'; break
+            for service in services:
+                if service.process.poll() is not None and service.service not in lifecycle.setdefault('exited_services', []):
+                    lifecycle['exited_services'].append(service.service)
+                    print(f'WARNING: {service.service} service exited; teleoperation continues without it.', flush=True)
+            if tunnel is not None and tunnel.poll() is not None and not lifecycle.get('tunnel_exited'):
+                lifecycle['tunnel_exited'] = True
+                print('WARNING: camera SSH tunnel exited; teleoperation continues without video.', flush=True)
         if sender.poll() is not None:
             result = sender.returncode
             lifecycle['stop_reason'] = 'sender_exited'

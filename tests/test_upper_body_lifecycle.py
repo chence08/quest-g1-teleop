@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from robot_service_runner import (Heartbeat, listening_port, service_command, supervise,
                                  controller_script, controller_processes, conflict_check, require_clear_conflict_check)
@@ -68,12 +68,13 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(events[0]['child_pid'], 0)
 
-    def test_stale_buffered_heartbeat_does_not_renew(self):
+    def test_any_ping_renews_despite_clock_skew(self):
         beat = Heartbeat(1.)
         beat.ingest(b'ping 10\n', wall_now=20., now=2.)
-        self.assertEqual(beat.last, 1.)
-        beat.ingest(b'ping 20\n', wall_now=20.02, now=3.)
-        self.assertEqual(beat.last, 3.)
+        self.assertEqual(beat.last, 2.)
+        beat.ingest(b'pong 20\n', wall_now=20.02, now=3.)
+        self.assertEqual(beat.last, 2.)
+        self.assertEqual(beat.ingest(b'stop\n', wall_now=0., now=4.), 'stop_requested')
 
     def test_only_named_services_and_explicit_devices(self):
         with self.assertRaises(ValueError): service_command('arbitrary', 20)
@@ -156,7 +157,7 @@ class LauncherTests(unittest.TestCase):
         command = remote_runner_command(args, 'camera')
         self.assertIn("'/dev/example;touch bad'", command[-1])
 
-    def test_conflict_refuses_execute_before_any_service(self):
+    def test_conflict_warns_but_still_starts_session(self):
         import subprocess
         import run_upper_body_session as launch
         previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
@@ -164,10 +165,15 @@ class LauncherTests(unittest.TestCase):
             check = {'event': 'conflict_check', 'check_version': 2, 'port_5602_listening': False,
                      'known_controller_processes': [{'pid': 8029, 'script': 'g1_controller_bridge.py'}],
                      'process_scan_complete': True, 'clear': False}
-            with tempfile.TemporaryDirectory() as directory, patch.object(launch.subprocess, 'run', return_value=subprocess.CompletedProcess([], 3, json.dumps(check), '')), patch.object(launch, 'OwnedService') as service, patch('sys.stdout', io.StringIO()), patch('sys.stderr', io.StringIO()):
-                result = launch.main(['--execute', '--host-ip', '192.0.2.10', '--report', str(Path(directory) / 'session.json')])
-                self.assertEqual(result, 1)
-                service.assert_not_called()
+            sender = Mock(returncode=0); sender.poll.return_value = 0
+            with tempfile.TemporaryDirectory() as directory, patch.object(launch.subprocess, 'run', return_value=subprocess.CompletedProcess([], 3, json.dumps(check), '')), patch.object(launch, 'OwnedService') as service, patch.object(launch.subprocess, 'Popen', return_value=sender), patch('sys.stdout', io.StringIO()), patch('sys.stderr', io.StringIO()):
+                service.return_value.configure_mock(service='hands', messages=[], **{'process.returncode': 0, 'process.poll.return_value': None})
+                report = Path(directory) / 'session.json'
+                result = launch.main(['--execute', '--host-ip', '192.0.2.10', '--report', str(report)])
+                self.assertEqual(result, 0)
+                service.assert_called_once()
+                lifecycle = json.loads(report.with_suffix('.lifecycle.json').read_text())
+                self.assertIn('g1_controller_bridge.py', lifecycle['conflict_warning'])
         finally:
             for number, handler in previous.items(): signal.signal(number, handler)
 

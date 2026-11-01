@@ -157,13 +157,9 @@ class Heartbeat:
         for line in parts[:-1]:
             if line.strip() == b'stop':
                 return 'stop_requested'
-            try:
-                verb, stamp = line.split()
-                age = wall_now - float(stamp)
-                if verb == b'ping' and math.isfinite(age) and -.2 <= age <= 2.:
-                    self.last = now
-            except (ValueError, TypeError):
-                continue
+            # Any ping renews: comparing its wall-clock stamp would fail on workstation/robot clock skew.
+            if line.split()[:1] == [b'ping']:
+                self.last = now
         return None
 
 
@@ -235,14 +231,14 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--service', choices=('hands', 'camera'))
     parser.add_argument('--camera-device')
-    parser.add_argument('--duration', type=float, default=600.)
+    parser.add_argument('--duration', type=float, default=4 * 3600.)
     parser.add_argument('--check-conflicts', action='store_true',
                         help='read-only port 5602 and known controller process check; does not establish exclusive ownership')
     args = parser.parse_args(argv)
     if not args.check_conflicts and not args.service:
         parser.error('--service is required')
-    if not math.isfinite(args.duration) or not 0 < args.duration <= 900:
-        parser.error('--duration must be in (0,900]')
+    if not math.isfinite(args.duration) or args.duration <= 0:
+        parser.error('--duration must be positive')
     if args.service == 'camera' and not args.camera_device:
         parser.error('--camera-device is required for camera')
     return args

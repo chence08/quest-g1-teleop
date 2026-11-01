@@ -31,16 +31,16 @@ Calibration aligns neutral operator wrists to the **measured robot posture**. He
 
 | Terminal input, followed by Enter | Action |
 | --- | --- |
-| `c` | Capture neutral while paused with stable tracking and appropriate feedback |
-| `r` | Start a bounded run after calibration, only when execution was explicitly enabled |
-| `p` | Release the arm overlay and stop finger-target submission; discard calibration |
+| `c` | Recalibrate at the current wrist and measured robot pose, also while running |
+| `r` | Start streaming (calibrates first if needed); requires `--execute` |
+| `p` | Ramp the arm overlay out and stop finger targets; calibration is kept |
 | `q` | Exit and clean up the session's owned services |
 
-Before its first write, the sender requires 0.5 seconds of valid tracking and ready feedback. It rechecks age after IK. After any write attempt, tracking/feedback loss or transport failure stops both streams and requires recalibration/rearming, including blocked or partial writes.
+The sender solves IK at 30 Hz, warm-started from its previous solution, and streams the latest target every tick. When hand packets are older than `--tracking-timeout`, or IK or retargeting fails, it resends the last target. SSH backpressure drops a frame. Only `p`, `q`, an arm-bridge exit or `--duration` end a run.
 
-Default arm limits include 0.5 translation scaling, 8 cm wrist translation, 0.25 rad rotation, 0.15 rad joint excursion and 0.15 rad/s slew. The 100 Hz robot bridge checks freshness, mode, motion and effort. It expects `mode_machine=6`/native FSM 500 without selecting modes or commanding waist, legs or head. Feedforward torque is zero because hand inertia is uncalibrated.
+The 250 Hz robot bridge holds the measured pose while the overlay weight ramps in, then tracks the latest target through an upstream-style joint velocity limit (scaling the whole move so no joint exceeds it) that ramps from 1 to 10 rad/s. Targets are clipped to URDF limits and feedforward torque to ±25 Nm. Out-of-order or malformed packets are skipped; stdin EOF ramps the weight out. Mode, FSM, measured motion, torque, drift and wall-clock checks are not enforced.
 
-Release returns control to the native controller and can move the arms; DFX can retain its last target. It is not a physical stop or guaranteed pose hold. Initial tests need support, clearance and an attended physical stop. Software bounds are not complete collision or force protection.
+Release returns control to the native controller and moves the arms to its pose; DFX keeps its last target. There are no automatic safety stops: keep an attended physical stop.
 
 ## Optional video
 

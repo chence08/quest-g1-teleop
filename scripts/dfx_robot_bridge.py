@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Bounded DFX-only DDS shim for newline JSON over SSH stdin/stdout.
+"""DFX-only DDS shim for newline JSON over SSH stdin/stdout.
 
-Default mode only subscribes to hand state. --execute enables a bounded hand
-publisher. No arm/body controllers, force settings, or return-home commands.
-Stopping publication does not disable the hand's onboard position controller.
+Default mode only subscribes to hand state. --execute republishes the latest
+received finger target at 20 Hz through a slew limit, like the upstream
+xr_teleoperate Inspire DFX controller. Late or malformed commands are skipped
+and the last good target is held; only stdin EOF, a signal or --duration end it.
 """
 
 import argparse
@@ -24,152 +25,98 @@ def finite_number(value):
 
 
 def validate_positions(values):
+    """Clip a finite 12-vector (right six, then left six) to normalized [0,1]."""
     if not isinstance(values, (list, tuple)) or len(values) != 12:
         raise ValueError("q must contain exactly 12 values (right six, then left six)")
-    if not all(finite_number(value) and 0.0 <= value <= 1.0 for value in values):
-        raise ValueError("all q values must be finite numbers in [0,1]")
-    return tuple(float(value) for value in values)
-
-
-def validate_lost(values):
-    if not isinstance(values, (list, tuple)) or len(values) != 12:
-        raise ValueError("lost must contain exactly 12 counters")
-    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in values):
-        raise ValueError("lost counters must be nonnegative integers")
-    return tuple(values)
+    if not all(finite_number(value) for value in values):
+        raise ValueError("all q values must be finite numbers")
+    return tuple(min(1.0, max(0.0, float(value))) for value in values)
 
 
 @dataclass(frozen=True)
 class Command:
     seq: int
-    sent_at: float
     q: tuple
-    received_monotonic: float
-    age_at_receipt: float
 
 
-def validate_command(packet, wall_now, monotonic_now, last_seq, max_age=0.3, future_tolerance=0.05):
+def validate_command(packet):
     if not isinstance(packet, dict):
         raise ValueError("command must be a JSON object")
     seq = packet.get("seq")
-    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0 or seq <= last_seq:
-        raise ValueError("seq must be a strictly increasing nonnegative integer")
-    sent_at = packet.get("sent_at")
-    if not finite_number(sent_at):
-        raise ValueError("sent_at must be a finite Unix timestamp in seconds")
-    age = wall_now - sent_at
-    if age < -future_tolerance or age > max_age:
-        raise ValueError("command timestamp is stale or too far in the future")
-    return Command(seq, float(sent_at), validate_positions(packet.get("q")), monotonic_now, max(0.0, age))
-
-
-def command_age(command, monotonic_now):
-    return command.age_at_receipt + max(0.0, monotonic_now - command.received_monotonic)
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        raise ValueError("seq must be an integer")
+    return Command(seq, validate_positions(packet.get("q")))
 
 
 class StateGate:
-    """Qualify fresh, consecutive state frames without rising serial-loss counters."""
+    """Latest hand state for telemetry; serial-loss counters are reported, not enforced."""
 
-    def __init__(self, minimum_frames=10):
-        self.minimum_frames = minimum_frames
+    def __init__(self):
         self.q = None
         self.lost = None
         self.received_at = None
-        self.stable_frames = 0
-        self.reason = "waiting_for_state"
-
-    def invalidate(self, reason):
-        self.stable_frames = 0
-        self.reason = reason
+        self.invalid = 0
 
     def update(self, q, lost, now):
         try:
-            checked_q, checked_lost = validate_positions(q), validate_lost(lost)
-        except ValueError as exc:
-            self.invalidate("invalid_state: " + str(exc))
+            self.q = validate_positions(q)
+        except ValueError:
+            self.invalid += 1
             return False
-        increased = self.lost is not None and any(new > old for new, old in zip(checked_lost, self.lost))
-        self.q, self.lost, self.received_at = checked_q, checked_lost, now
-        if increased:
-            self.invalidate("serial_loss_counter_increased")
-            return False
-        self.stable_frames += 1
-        self.reason = "ready" if self.stable_frames >= self.minimum_frames else "qualifying_state"
-        return self.stable_frames >= self.minimum_frames
+        self.lost = list(lost) if isinstance(lost, (list, tuple)) else None
+        self.received_at = now
+        return True
 
     def snapshot(self, now, max_age):
         age = None if self.received_at is None else max(0.0, now - self.received_at)
-        fresh = age is not None and age <= max_age
-        if not fresh and self.stable_frames:
-            # Fresh samples must qualify again following a stream interruption.
-            self.invalidate("stale_state")
-        return {"ready": fresh and self.stable_frames >= self.minimum_frames,
-                "q": self.q, "lost": self.lost, "stable_frames": self.stable_frames,
-                "state_age_s": age, "reason": self.reason}
+        ready = age is not None and age <= max_age
+        return {"ready": ready, "q": self.q, "lost": self.lost, "state_age_s": age,
+                "invalid_states": self.invalid,
+                "reason": "ready" if ready else ("waiting_for_state" if age is None else "stale_state")}
 
 
 class CommandMailbox:
-    """Single-slot command mailbox; invalid input clears the previous target."""
+    """Latest good command wins; bad or out-of-order packets are counted and skipped."""
 
-    def __init__(self, max_age=0.3):
-        self.max_age = max_age
+    def __init__(self):
         self.lock = threading.Lock()
         self.latest = None
         self.last_seq = -1
+        self.rejected = 0
+        self.last_error = None
         self.eof = False
-        self.reason = "waiting_for_command"
 
-    def ingest(self, packet, wall_now, monotonic_now):
+    def ingest(self, packet):
+        try:
+            command = validate_command(packet)
+        except ValueError as exc:
+            with self.lock:
+                self.rejected += 1
+                self.last_error = str(exc)
+            return False
         with self.lock:
-            try:
-                command = validate_command(packet, wall_now, monotonic_now, self.last_seq, self.max_age)
-            except ValueError as exc:
-                self.latest = None
-                self.reason = "invalid_command: " + str(exc)
+            if command.seq <= self.last_seq:
                 return False
-            self.latest = command
-            self.last_seq = command.seq
-            self.reason = "command_received"
-            return True
-
-    def invalidate(self, reason):
-        with self.lock:
-            self.latest = None
-            self.reason = reason
+            self.latest, self.last_seq = command, command.seq
+        return True
 
     def mark_eof(self):
         with self.lock:
             self.eof = True
-            self.latest = None
-            self.reason = "stdin_eof"
 
-    def snapshot(self, now):
+    def snapshot(self):
         with self.lock:
-            age = None if self.latest is None else command_age(self.latest, now)
-            command = self.latest if not self.eof and age is not None and age <= self.max_age else None
-            reason = self.reason
-            if age is not None and age > self.max_age:
-                reason = "stale_command"
-            return command, age, reason, self.eof
+            return self.latest, self.eof
 
 
-def bounded_step(initial, previous, requested, dt, slew_rate=0.15, max_excursion=0.15):
-    initial, previous, requested = map(validate_positions, (initial, previous, requested))
-    if not all(finite_number(value) and value >= 0 for value in (dt, slew_rate, max_excursion)):
-        raise ValueError("rate, excursion, and timestep must be finite and nonnegative")
-    result = []
+def slew_step(previous, requested, dt, slew_rate=5.0):
     maximum_step = slew_rate * dt
-    for origin, old, target in zip(initial, previous, requested):
-        low, high = max(0.0, origin - max_excursion), min(1.0, origin + max_excursion)
-        if not low - 1e-9 <= old <= high + 1e-9:
-            raise ValueError("previous command is outside the initial excursion envelope")
-        target = min(high, max(low, target))
-        result.append(min(high, max(low, old + min(maximum_step, max(-maximum_step, target - old)))))
-    return tuple(result)
+    return tuple(min(1.0, max(0.0, old + min(maximum_step, max(-maximum_step, target - old))))
+                 for old, target in zip(validate_positions(previous), validate_positions(requested)))
 
 
 def read_commands(stream, mailbox, stop_event):
-    """Read bounded newline records without holding stdin's buffered lock at exit."""
+    """Read newline records without holding stdin's buffered lock at exit."""
     pending = b""
     try:
         descriptor = stream.fileno()
@@ -181,18 +128,17 @@ def read_commands(stream, mailbox, stop_event):
                 break
             pending += data
             if len(pending) > 65536:
-                mailbox.invalidate("input_record_too_large")
-                break
+                pending = pending[pending.rfind(b"\n") + 1:] if b"\n" in pending else b""
             while b"\n" in pending:
                 line, pending = pending.split(b"\n", 1)
                 try:
                     packet = json.loads(line)
-                except (ValueError, TypeError, UnicodeError) as exc:
-                    mailbox.invalidate("invalid_json: " + str(exc))
+                except (ValueError, TypeError, UnicodeError):
+                    mailbox.ingest(None)
                     continue
-                mailbox.ingest(packet, time.time(), time.monotonic())
-    except Exception as exc:
-        mailbox.invalidate("stdin_error: " + str(exc))
+                mailbox.ingest(packet)
+    except Exception:
+        pass
     finally:
         mailbox.mark_eof()
 
@@ -206,24 +152,15 @@ def parse_args(argv=None):
     parser.add_argument("--interface", default=load_config()['G1_HAND_INTERFACE'])
     parser.add_argument("--namespace", default=load_config()['G1_DDS_NAMESPACE'])
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--duration", type=float, help="default 15 seconds read-only, 30 execute; maximum 120")
-    parser.add_argument("--slew-rate", type=float, default=0.15, help="maximum normalized target change per second")
-    parser.add_argument("--max-excursion", type=float, default=0.15, help="per-joint range on either side of initial measured position")
-    parser.add_argument("--max-age", type=float, default=0.3, help="maximum command age in seconds")
-    parser.add_argument("--state-max-age", type=float, default=0.3)
-    parser.add_argument("--startup-timeout", type=float, default=10.0)
+    parser.add_argument("--duration", type=float, default=0.0, help="seconds; 0 runs until stdin EOF or a signal")
+    parser.add_argument("--slew-rate", type=float, default=5.0, help="maximum normalized target change per second")
+    parser.add_argument("--state-max-age", type=float, default=0.5)
     args = parser.parse_args(argv)
-    if args.duration is None:
-        args.duration = 30.0 if args.execute else 15.0
     if not re.fullmatch(r"[A-Za-z0-9_]+", args.namespace):
         parser.error("--namespace must contain only letters, digits and underscores")
-    for name in ("duration", "slew_rate", "max_excursion", "max_age", "state_max_age", "startup_timeout"):
-        if not finite_number(getattr(args, name)) or getattr(args, name) <= 0:
-            parser.error(f"--{name.replace('_', '-')} must be finite and positive")
-    if args.duration > 120:
-        parser.error("--duration cannot exceed 120 seconds")
-    if args.max_excursion > 1:
-        parser.error("--max-excursion cannot exceed 1 normalized unit")
+    for name in ("duration", "slew_rate", "state_max_age"):
+        if not finite_number(getattr(args, name)) or getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
     return args
 
 
@@ -234,28 +171,24 @@ def main(argv=None):
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
 
     ChannelFactoryInitialize(0, networkInterface=args.interface)
-    gate = StateGate(minimum_frames=10)
+    gate = StateGate()
     state_lock = threading.Lock()
-    mailbox = CommandMailbox(args.max_age)
+    mailbox = CommandMailbox()
     reader_stop = threading.Event()
     reader = None
     publisher = None
     subscriber = None
-    initial = previous = None
-    last_published_seq = None
-    published_count = 0
-    exit_code = 0
+    previous = None
+    published_count = write_failures = 0
     started = time.monotonic()
 
     def on_state(message):
         with state_lock:
             try:
                 states = message.states
-                if len(states) != 12:
-                    raise ValueError("state message must contain exactly 12 motors")
                 gate.update([motor.q for motor in states], [motor.lost for motor in states], time.monotonic())
-            except Exception as exc:
-                gate.invalidate("invalid_state: " + str(exc))
+            except Exception:
+                gate.invalid += 1
 
     try:
         subscriber = ChannelSubscriber(f"rt/{args.namespace}/state", MotorStates_)
@@ -265,76 +198,64 @@ def main(argv=None):
             reader.start()
         emit("status", status="started", mode="execute" if args.execute else "read_only",
              interface=args.interface, namespace=args.namespace, duration_s=args.duration,
-             command_max_age_s=args.max_age, state_max_age_s=args.state_max_age,
-             slew_rate=args.slew_rate, max_excursion=args.max_excursion,
-             stop_behavior="stop publishing; no open, home, force change or actuator disable")
+             slew_rate=args.slew_rate, ready=True)
         next_report, previous_tick = started, time.monotonic()
-        while time.monotonic() - started < args.duration:
+        while not args.duration or time.monotonic() - started < args.duration:
             now = time.monotonic()
             # Never accumulate a catch-up motion after a stall or pause.
             dt = min(0.05, max(0.0, now - previous_tick))
             previous_tick = now
             with state_lock:
                 state = gate.snapshot(now, args.state_max_age)
-            command, age, command_reason, eof = mailbox.snapshot(now)
-            status = "read_only" if not args.execute else command_reason
-            if state["ready"] and initial is None:
-                initial = previous = state["q"]
-                emit("status", status="state_qualified", initial_q=initial, stable_frames=state["stable_frames"])
-            if initial is None and now - started >= min(args.startup_timeout, args.duration):
-                emit("status", status="startup_timeout", reason=state["reason"])
-                exit_code = 2
+            command, eof = mailbox.snapshot()
+            if args.execute and eof:
+                emit("status", status="stdin_eof", published_count=published_count)
                 break
-            if args.execute and state["ready"] and command is not None:
+            if args.execute and command is not None:
                 if publisher is None:
                     from unitree_sdk2py.core.channel import ChannelPublisher
                     from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_
                     from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
                     publisher = ChannelPublisher(f"rt/{args.namespace}/cmd", MotorCmds_)
                     publisher.Init()
-                    # Init may block briefly; recheck both sources before writing.
-                    continue
-                target = bounded_step(initial, previous, command.q, dt, args.slew_rate, args.max_excursion)
+                if previous is None:
+                    previous = state["q"] if state["q"] is not None else command.q
+                previous = slew_step(previous, command.q, dt, args.slew_rate)
                 msg = MotorCmds_()
                 msg.cmds = [unitree_go_msg_dds__MotorCmd_() for _ in range(12)]
-                for motor, value in zip(msg.cmds, target):
+                for motor, value in zip(msg.cmds, previous):
                     motor.q = value
-                # Recheck immediately before a write, including stdin EOF.
-                latest, _, _, _ = mailbox.snapshot(time.monotonic())
-                with state_lock:
-                    state_still_ready = gate.snapshot(time.monotonic(), args.state_max_age)["ready"]
-                if latest is not None and latest.seq == command.seq and state_still_ready:
-                    if publisher.Write(msg) is False:
-                        raise RuntimeError("DDS hand command write failed")
-                    previous = target
-                    last_published_seq = command.seq
+                try:
+                    written = publisher.Write(msg)
+                except Exception:
+                    written = False
+                if written is False:
+                    write_failures += 1
+                else:
                     published_count += 1
-                    status = "publishing"
-            elif args.execute and not state["ready"]:
-                status = "paused_" + state["reason"]
             if now >= next_report:
-                emit("state", mode="execute" if args.execute else "read_only", status=status,
-                     **state, command_age_s=age, command_seq=None if command is None else command.seq,
-                     last_published_seq=last_published_seq, last_command_q=previous if published_count else None,
-                     published_count=published_count, stdin_eof=eof)
+                # ready=True keeps the workstation sending even while hand feedback is late.
+                emit("state", mode="execute" if args.execute else "read_only", **{**state, "ready": True},
+                     state_ready=state["ready"], command_seq=None if command is None else command.seq,
+                     last_command_q=previous, published_count=published_count, write_failures=write_failures,
+                     rejected_commands=mailbox.rejected, last_command_error=mailbox.last_error)
                 next_report = now + 0.5
-            if args.execute and eof:
-                emit("status", status="stdin_eof_no_more_commands", published_count=published_count)
-                break
             time.sleep(max(0.0, 0.05 - (time.monotonic() - now)))
     except KeyboardInterrupt:
-        emit("status", status="interrupted_no_more_commands", published_count=published_count)
+        emit("status", status="interrupted", published_count=published_count)
     finally:
         reader_stop.set()
         if reader is not None:
             reader.join(timeout=0.2)
-        # Closing transports sends no final posture command.
-        if publisher is not None:
-            publisher.Close()
-        if subscriber is not None:
-            subscriber.Close()
+        # Closing transports sends no final posture command; the hand holds its last target.
+        for channel in (publisher, subscriber):
+            if channel is not None:
+                try:
+                    channel.Close()
+                except Exception:
+                    pass
         emit("status", status="finished", published_count=published_count)
-    return exit_code
+    return 0
 
 
 if __name__ == "__main__":
